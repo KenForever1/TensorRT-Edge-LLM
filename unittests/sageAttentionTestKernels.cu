@@ -19,10 +19,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 11080
 #include <cuda_fp8.h>
-#endif
 
 #include <cfloat>
 #include <cmath>
@@ -167,14 +164,8 @@ __global__ void quantizeToInt8PerWarpKernel(half const* input, int8_t* output, f
 
 __device__ int8_t convertToFp8Byte(float const value)
 {
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 11080 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
     __nv_fp8_e4m3 const fp8Value(value);
     return *reinterpret_cast<int8_t const*>(&fp8Value);
-#else
-    // This helper is only valid for the SM89 SageAttention path. The fallback is only present so lower-arch
-    // host/device compilation can succeed; runtime tests skip before launching on unsupported GPUs.
-    return 0;
-#endif
 }
 
 __global__ void quantizeToFp8TransposedKernel(half const* input, int8_t* output, int32_t const batchSize,

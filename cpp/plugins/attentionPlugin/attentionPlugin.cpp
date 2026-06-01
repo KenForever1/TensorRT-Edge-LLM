@@ -24,6 +24,8 @@
 #include "kernels/contextAttentionKernels/utilKernels.h"
 #include "kernels/decodeAttentionKernels/decoderXQARunner.h"
 #include "kernels/posEncoding/applyRopeWriteKV.h"
+#include "kernels/sageAttentionKernels/sageAttentionRuntimeKernels.h"
+#include "kernels/sageAttentionKernels/sageAttentionRunner.h"
 #include "plugins/utils/pluginUtils.h"
 
 // CuTe DSL FMHA kernel (Blackwell SM100+)
@@ -143,6 +145,15 @@ AttentionExecutionMode deduceModeTreeAttention(
     }
 
     return AttentionExecutionMode::kINVALID;
+}
+
+bool canUseSageDecode(AttentionExecutionMode executionMode, int32_t runtimeSeqLen, int32_t smVersion,
+    nvinfer1::DataType dataType, int32_t headSize, int32_t numQHeads, int32_t numKVHeads, int32_t slidingWindowSize,
+    int32_t enableTreeAttention, int32_t enableFp8KVCache) noexcept
+{
+    return executionMode == AttentionExecutionMode::kVANILLA_DECODING && runtimeSeqLen == 1 && enableTreeAttention == 0
+        && enableFp8KVCache == 0 && slidingWindowSize <= 0 && numKVHeads > 0 && numQHeads % numKVHeads == 0
+        && SageAttentionRunner::canImplement(headSize, smVersion, dataType);
 }
 
 bool loadFMHAKernels(bool& useCuteDslFMHA, int32_t headSize, int32_t smVersion, nvinfer1::DataType dataType)
@@ -602,6 +613,24 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
     }
 #endif
 
+    if (!mEnableFp8KVCache && mSlidingWindowSize <= 0
+        && SageAttentionRunner::canImplement(mHeadSize, mSMVersion, mDataType))
+    {
+        int64_t const maxSagePaddedKvLen = sage::getSagePaddedKvLen(static_cast<int32_t>(maxKVCacheCapacity));
+        workspaceSize = accumulateWorkspaceSize(
+            workspaceSize, rt::Coords{maxBatchSize, 1, mNumQHeads, mHeadSize}, DataType::kINT8);
+        workspaceSize = accumulateWorkspaceSize(workspaceSize,
+            rt::Coords{maxBatchSize, maxKVCacheCapacity, mNumKVHeads, mHeadSize}, DataType::kINT8);
+        workspaceSize = accumulateWorkspaceSize(workspaceSize,
+            rt::Coords{maxBatchSize, mHeadSize, mNumKVHeads, maxSagePaddedKvLen}, DataType::kINT8);
+        workspaceSize = accumulateWorkspaceSize(workspaceSize,
+            rt::Coords{sage::getSageQScaleSize(static_cast<int32_t>(maxBatchSize), 1, mNumQHeads)}, DataType::kFLOAT);
+        workspaceSize = accumulateWorkspaceSize(workspaceSize,
+            rt::Coords{sage::getSageKScaleSize(static_cast<int32_t>(maxBatchSize), static_cast<int32_t>(maxKVCacheCapacity),
+                mNumKVHeads)},
+            DataType::kFLOAT);
+    }
+
     // Request another alignment size to align the workspace pointer.
     workspaceSize += kDEVICE_ALIGNMENT;
 
@@ -836,6 +865,84 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             // Execute vanilla decoding.
             kernel::launchApplyRopeWriteKV(ropeCosSinTensor, contextLengthTensor, qInputTensor, kInputTensor,
                 vInputTensor, kvCacheTensor, kScale, vScale, stream, false);
+
+            bool const useSageDecode = canUseSageDecode(executionMode, runtimeSeqLen, mSMVersion, mDataType, mHeadSize,
+                mNumQHeads, mNumKVHeads, mSlidingWindowSize, mEnableTreeAttention, mEnableFp8KVCache);
+            if (useSageDecode)
+            {
+                std::vector<int32_t> hostContextLengths(runtimeBatchSize);
+                cudaError_t sageStatus = cudaMemcpyAsync(hostContextLengths.data(), contextLengthTensor.rawPointer(),
+                    hostContextLengths.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+                if (sageStatus == cudaSuccess)
+                {
+                    sageStatus = cudaStreamSynchronize(stream);
+                }
+                bool uniformContextLength = sageStatus == cudaSuccess && !hostContextLengths.empty();
+                for (int32_t const contextLength : hostContextLengths)
+                {
+                    uniformContextLength = uniformContextLength && contextLength == hostContextLengths[0];
+                }
+                if (sageStatus != cudaSuccess)
+                {
+                    LOG_ERROR("Failed to read context lengths for SageAttention decode: %s", cudaGetErrorString(sageStatus));
+                }
+
+                int32_t const qoLen = runtimeSeqLen;
+                int32_t const kvLen = uniformContextLength ? hostContextLengths[0] : 0;
+                if (uniformContextLength && kvLen > 0 && kvLen <= kvCacheCapacity)
+                {
+                    int32_t const paddedKvLen = sage::getSagePaddedKvLen(kvLen);
+                    rt::Tensor qInt8Tensor = assignTensorFromWorkspace(
+                        alignedWorkspacePtr, {runtimeBatchSize, qoLen, mNumQHeads, mHeadSize}, DataType::kINT8);
+                    rt::Tensor kInt8Tensor = assignTensorFromWorkspace(
+                        alignedWorkspacePtr, {runtimeBatchSize, kvLen, mNumKVHeads, mHeadSize}, DataType::kINT8);
+                    rt::Tensor vFp8Tensor = assignTensorFromWorkspace(
+                        alignedWorkspacePtr, {runtimeBatchSize, mHeadSize, mNumKVHeads, paddedKvLen}, DataType::kINT8);
+                    rt::Tensor qScaleTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                        {sage::getSageQScaleSize(runtimeBatchSize, qoLen, mNumQHeads)}, DataType::kFLOAT);
+                    rt::Tensor kScaleTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                        {sage::getSageKScaleSize(runtimeBatchSize, kvLen, mNumKVHeads)}, DataType::kFLOAT);
+
+                    sage::launchSageQuantizeQToInt8(qInputTensor, qInt8Tensor, qScaleTensor, stream);
+                    sage::launchSageConvertKVCacheToInt8AndFp8(
+                        kvCacheTensor, contextLengthTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, kvLen, stream);
+
+                    SageAttentionParams sageParams{};
+                    sageParams.q_ptr = qInt8Tensor.dataPointer<int8_t>();
+                    sageParams.k_ptr = kInt8Tensor.dataPointer<int8_t>();
+                    sageParams.v_ptr = vFp8Tensor.dataPointer<int8_t>();
+                    sageParams.o_ptr = attentionOutputTensor.rawPointer();
+                    sageParams.q_scale_ptr = qScaleTensor.dataPointer<float>();
+                    sageParams.k_scale_ptr = kScaleTensor.dataPointer<float>();
+                    sageParams.batch_size = runtimeBatchSize;
+                    sageParams.qo_len = qoLen;
+                    sageParams.kv_len = kvLen;
+                    sageParams.num_qo_heads = mNumQHeads;
+                    sageParams.num_kv_heads = mNumKVHeads;
+                    sageParams.head_dim = mHeadSize;
+                    sageParams.tensor_layout = SageTensorLayout::kBSHD;
+                    sageParams.mask_mode = SageMaskMode::kCausal;
+                    sageParams.qk_quant_gran = SageQuantGranularity::kPerWarp;
+                    sageParams.stride_bz_q = qoLen * mNumQHeads * mHeadSize;
+                    sageParams.stride_seq_q = mNumQHeads * mHeadSize;
+                    sageParams.stride_h_q = mHeadSize;
+                    sageParams.stride_bz_k = kvLen * mNumKVHeads * mHeadSize;
+                    sageParams.stride_seq_k = mNumKVHeads * mHeadSize;
+                    sageParams.stride_h_k = mHeadSize;
+                    sageParams.stride_bz_v = mHeadSize * mNumKVHeads * paddedKvLen;
+                    sageParams.stride_h_v = paddedKvLen;
+                    sageParams.stride_d_v = mNumKVHeads * paddedKvLen;
+                    sageParams.stride_bz_o = qoLen * mNumQHeads * mHeadSize;
+                    sageParams.stride_seq_o = mNumQHeads * mHeadSize;
+                    sageParams.stride_h_o = mHeadSize;
+
+                    SageAttentionRunner sageRunner(mDataType, runtimeBatchSize, qoLen, kvLen, mNumQHeads, mNumKVHeads,
+                        mHeadSize, mSMVersion, SageTensorLayout::kBSHD, SageMaskMode::kCausal,
+                        SageQuantGranularity::kPerWarp);
+                    sageRunner.run(sageParams, nullptr, stream);
+                    return 0;
+                }
+            }
         }
 
         auto xqaRunner = DecoderXQARunner(mDataType, selectKvCacheDataType(mEnableFp8KVCache), runtimeBatchSize,
