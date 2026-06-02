@@ -67,6 +67,16 @@ struct SageAttentionParams
     //! \brief Output LSE (log-sum-exp) pointer (optional)
     float* lse_ptr{}; //!< Log-sum-exp output [B, H, S] (optional)
 
+    //! \brief Per-batch effective key/value sequence lengths (device pointer, optional)
+    //!
+    //! When non-null, the kernel uses sequence_lengths[batch_id] as the effective
+    //! kv_len for that batch (clamped to params.kv_len). This enables CUDA graph
+    //! capture by removing the need for host-side knowledge of per-step kv_len:
+    //! params.kv_len holds the layout/capacity bound used for K_scale indexing
+    //! and strides, while sequence_lengths controls iteration count and masking.
+    //! When null, kernel uses params.kv_len uniformly across all batches.
+    int32_t const* sequence_lengths{};
+
     //! \brief Dimensions
     int32_t batch_size{};    //!< Batch size
     int32_t qo_len{};        //!< Query/output sequence length

@@ -42,6 +42,7 @@ template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint3
         typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_scale=false, bool fuse_v_mean=false, bool use_pv_fp16_accu=false>
 __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V, DTypeOut *__restrict__ O, float *__restrict__ Lse,
                       float *__restrict__ Q_scale, float *__restrict__ K_scale, float *__restrict__ V_scale, float *__restrict__ V_mean,
+                      const int32_t *__restrict__ seq_lens,
                       const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
                       const uint32_t stride_bz_q, const uint32_t stride_seq_q, const uint32_t stride_h_q, 
                       const uint32_t stride_bz_k, const uint32_t stride_seq_k, const uint32_t stride_h_k,
@@ -82,6 +83,15 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
   const uint32_t bx = blockIdx.x;
   const uint32_t num_qo_heads = gridDim.y;
   const uint32_t head_id = blockIdx.y;
+
+  // Per-batch effective kv_len (for CUDA-graph-compatible dynamic kv length).
+  // When seq_lens is null, all batches use the layout-defined kv_len.
+  // When non-null, iteration count, K-load predicate, and out-of-bound masking
+  // are driven by min(seq_lens[batch_id], kv_len); K_scale indexing and strides
+  // continue to use the layout kv_len so workspace shape stays static.
+  const uint32_t effective_kv_len = (seq_lens != nullptr)
+      ? min(static_cast<uint32_t>(seq_lens[batch_id]), kv_len)
+      : kv_len;
 
   // transfer to base 2 instead of base e with better numerical efficiency
   sm_scale *= math::log2e;
@@ -218,8 +228,8 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
   const uint32_t num_iterations = div_ceil(
       mask_mode == MaskMode::kCausal
-          ? min(kv_len, (bx + 1) * CTA_Q)
-          : kv_len,
+          ? min(effective_kv_len, (bx + 1) * CTA_Q)
+          : effective_kv_len,
       CTA_K);
 
   // load Q with predicate
@@ -243,7 +253,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
   // load K with predicate
   load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
-    &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
+    &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, effective_kv_len);
   cp_async::commit_group();
 
   float q_scale = Q_scale[q_scale_idx];
@@ -433,7 +443,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
 
     // load K with predicate
     load_global_to_share<global_to_shared_line_lanes_QK, global_to_shared_copy_lines_per_warp_QK, QK_smem_iters_row, K_smem_iters_col, swizzle_mode_QK, QK_SMEM_STRIDE / PACK_SIZE_QK, CTA_K>(
-      &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, kv_len);
+      &K_lane_base_ptr, K_smem_offset_load, stride_seq_k, smem_K, K_load_idx_lane_base, effective_kv_len);
     cp_async::commit_group();
 
     dequant_scale = q_scale * K_scale[k_scale_idx + (num_iterations - 1) * k_scale_advance_offset];
@@ -511,7 +521,7 @@ __global__ void qk_int_sv_f8_attn_kernel(int8_t *__restrict__ Q, int8_t *__restr
     {
       apply_causal_mask<num_tiles_q, num_tiles_k>(Q_idx_lane_base, K_idx_lane_base, RS_f32);
     }
-    apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(K_idx_lane_base, RS_f32, kv_len);
+    apply_out_of_bound_mask<num_tiles_q, num_tiles_k>(K_idx_lane_base, RS_f32, effective_kv_len);
     K_idx_lane_base += CTA_K;
 
     if constexpr (std::is_same<DTypeSVAccum, float>::value)

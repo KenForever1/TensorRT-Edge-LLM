@@ -24,6 +24,7 @@
 #include "kernels/contextAttentionKernels/utilKernels.h"
 #include "kernels/decodeAttentionKernels/decoderXQARunner.h"
 #include "kernels/posEncoding/applyRopeWriteKV.h"
+#include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "kernels/sageAttentionKernels/sageAttentionRuntimeKernels.h"
 #include "kernels/sageAttentionKernels/sageAttentionRunner.h"
 #include "plugins/utils/pluginUtils.h"
@@ -866,82 +867,75 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             kernel::launchApplyRopeWriteKV(ropeCosSinTensor, contextLengthTensor, qInputTensor, kInputTensor,
                 vInputTensor, kvCacheTensor, kScale, vScale, stream, false);
 
+            // SageAttention decode: graph-capture safe path.
+            // Use kvCacheCapacity as the layout kv_len so all workspace sizing,
+            // strides, and kernel template selection are runtime-shape-invariant.
+            // Per-batch effective kv_len is read on-device via sequenceLengths,
+            // which both the convert kernel (zero-fills beyond effective_kv_len)
+            // and the SageAttention kernel (padding-mask via seq_lens) consume.
             bool const useSageDecode = canUseSageDecode(executionMode, runtimeSeqLen, mSMVersion, mDataType, mHeadSize,
                 mNumQHeads, mNumKVHeads, mSlidingWindowSize, mEnableTreeAttention, mEnableFp8KVCache);
-            if (useSageDecode)
+            if (useSageDecode && kvCacheCapacity > 0)
             {
-                std::vector<int32_t> hostContextLengths(runtimeBatchSize);
-                cudaError_t sageStatus = cudaMemcpyAsync(hostContextLengths.data(), contextLengthTensor.rawPointer(),
-                    hostContextLengths.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
-                if (sageStatus == cudaSuccess)
-                {
-                    sageStatus = cudaStreamSynchronize(stream);
-                }
-                bool uniformContextLength = sageStatus == cudaSuccess && !hostContextLengths.empty();
-                for (int32_t const contextLength : hostContextLengths)
-                {
-                    uniformContextLength = uniformContextLength && contextLength == hostContextLengths[0];
-                }
-                if (sageStatus != cudaSuccess)
-                {
-                    LOG_ERROR("Failed to read context lengths for SageAttention decode: %s", cudaGetErrorString(sageStatus));
-                }
-
                 int32_t const qoLen = runtimeSeqLen;
-                int32_t const kvLen = uniformContextLength ? hostContextLengths[0] : 0;
-                if (uniformContextLength && kvLen > 0 && kvLen <= kvCacheCapacity)
-                {
-                    int32_t const paddedKvLen = sage::getSagePaddedKvLen(kvLen);
-                    rt::Tensor qInt8Tensor = assignTensorFromWorkspace(
-                        alignedWorkspacePtr, {runtimeBatchSize, qoLen, mNumQHeads, mHeadSize}, DataType::kINT8);
-                    rt::Tensor kInt8Tensor = assignTensorFromWorkspace(
-                        alignedWorkspacePtr, {runtimeBatchSize, kvLen, mNumKVHeads, mHeadSize}, DataType::kINT8);
-                    rt::Tensor vFp8Tensor = assignTensorFromWorkspace(
-                        alignedWorkspacePtr, {runtimeBatchSize, mHeadSize, mNumKVHeads, paddedKvLen}, DataType::kINT8);
-                    rt::Tensor qScaleTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
-                        {sage::getSageQScaleSize(runtimeBatchSize, qoLen, mNumQHeads)}, DataType::kFLOAT);
-                    rt::Tensor kScaleTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
-                        {sage::getSageKScaleSize(runtimeBatchSize, kvLen, mNumKVHeads)}, DataType::kFLOAT);
+                int32_t const kvLen = kvCacheCapacity;
+                int32_t const paddedKvLen = sage::getSagePaddedKvLen(kvLen);
 
-                    sage::launchSageQuantizeQToInt8(qInputTensor, qInt8Tensor, qScaleTensor, stream);
-                    sage::launchSageConvertKVCacheToInt8AndFp8(
-                        kvCacheTensor, contextLengthTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, kvLen, stream);
+                rt::Tensor qInt8Tensor = assignTensorFromWorkspace(
+                    alignedWorkspacePtr, {runtimeBatchSize, qoLen, mNumQHeads, mHeadSize}, DataType::kINT8);
+                rt::Tensor kInt8Tensor = assignTensorFromWorkspace(
+                    alignedWorkspacePtr, {runtimeBatchSize, kvLen, mNumKVHeads, mHeadSize}, DataType::kINT8);
+                rt::Tensor vFp8Tensor = assignTensorFromWorkspace(
+                    alignedWorkspacePtr, {runtimeBatchSize, mHeadSize, mNumKVHeads, paddedKvLen}, DataType::kINT8);
+                rt::Tensor qScaleTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                    {sage::getSageQScaleSize(runtimeBatchSize, qoLen, mNumQHeads)}, DataType::kFLOAT);
+                rt::Tensor kScaleTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                    {sage::getSageKScaleSize(runtimeBatchSize, kvLen, mNumKVHeads)}, DataType::kFLOAT);
+                // sequence_lengths == contextLengthTensor: contextLength already equals the number
+                // of valid KV tokens INCLUDING the new decode write performed by applyRopeWriteKV
+                // above (which writes at slot contextLength-1). Sage's convert kernel and attention
+                // kernel both interpret seq_lens[b] as "number of valid KV tokens", so we pass
+                // contextLengthTensor directly (no +qoLen — that would be off-by-one).
+                sage::launchSageQuantizeQToInt8(qInputTensor, qInt8Tensor, qScaleTensor, stream);
+                sage::launchSageConvertKVCacheToInt8AndFp8(
+                    kvCacheTensor, contextLengthTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, kvLen, stream);
 
-                    SageAttentionParams sageParams{};
-                    sageParams.q_ptr = qInt8Tensor.dataPointer<int8_t>();
-                    sageParams.k_ptr = kInt8Tensor.dataPointer<int8_t>();
-                    sageParams.v_ptr = vFp8Tensor.dataPointer<int8_t>();
-                    sageParams.o_ptr = attentionOutputTensor.rawPointer();
-                    sageParams.q_scale_ptr = qScaleTensor.dataPointer<float>();
-                    sageParams.k_scale_ptr = kScaleTensor.dataPointer<float>();
-                    sageParams.batch_size = runtimeBatchSize;
-                    sageParams.qo_len = qoLen;
-                    sageParams.kv_len = kvLen;
-                    sageParams.num_qo_heads = mNumQHeads;
-                    sageParams.num_kv_heads = mNumKVHeads;
-                    sageParams.head_dim = mHeadSize;
-                    sageParams.tensor_layout = SageTensorLayout::kBSHD;
-                    sageParams.mask_mode = SageMaskMode::kCausal;
-                    sageParams.qk_quant_gran = SageQuantGranularity::kPerWarp;
-                    sageParams.stride_bz_q = qoLen * mNumQHeads * mHeadSize;
-                    sageParams.stride_seq_q = mNumQHeads * mHeadSize;
-                    sageParams.stride_h_q = mHeadSize;
-                    sageParams.stride_bz_k = kvLen * mNumKVHeads * mHeadSize;
-                    sageParams.stride_seq_k = mNumKVHeads * mHeadSize;
-                    sageParams.stride_h_k = mHeadSize;
-                    sageParams.stride_bz_v = mHeadSize * mNumKVHeads * paddedKvLen;
-                    sageParams.stride_h_v = paddedKvLen;
-                    sageParams.stride_d_v = mNumKVHeads * paddedKvLen;
-                    sageParams.stride_bz_o = qoLen * mNumQHeads * mHeadSize;
-                    sageParams.stride_seq_o = mNumQHeads * mHeadSize;
-                    sageParams.stride_h_o = mHeadSize;
+                SageAttentionParams sageParams{};
+                sageParams.q_ptr = qInt8Tensor.dataPointer<int8_t>();
+                sageParams.k_ptr = kInt8Tensor.dataPointer<int8_t>();
+                sageParams.v_ptr = vFp8Tensor.dataPointer<int8_t>();
+                sageParams.o_ptr = attentionOutputTensor.rawPointer();
+                sageParams.q_scale_ptr = qScaleTensor.dataPointer<float>();
+                sageParams.k_scale_ptr = kScaleTensor.dataPointer<float>();
+                sageParams.sequence_lengths = contextLengthTensor.dataPointer<int32_t>();
+                sageParams.batch_size = runtimeBatchSize;
+                sageParams.qo_len = qoLen;
+                sageParams.kv_len = kvLen;
+                sageParams.num_qo_heads = mNumQHeads;
+                sageParams.num_kv_heads = mNumKVHeads;
+                sageParams.head_dim = mHeadSize;
+                sageParams.sm_scale = 1.0f / std::sqrt(static_cast<float>(mHeadSize));
+                sageParams.tensor_layout = SageTensorLayout::kBSHD;
+                sageParams.mask_mode = SageMaskMode::kNone;
+                sageParams.qk_quant_gran = SageQuantGranularity::kPerWarp;
+                sageParams.stride_bz_q = qoLen * mNumQHeads * mHeadSize;
+                sageParams.stride_seq_q = mNumQHeads * mHeadSize;
+                sageParams.stride_h_q = mHeadSize;
+                sageParams.stride_bz_k = kvLen * mNumKVHeads * mHeadSize;
+                sageParams.stride_seq_k = mNumKVHeads * mHeadSize;
+                sageParams.stride_h_k = mHeadSize;
+                sageParams.stride_bz_v = mHeadSize * mNumKVHeads * paddedKvLen;
+                sageParams.stride_h_v = paddedKvLen;
+                sageParams.stride_d_v = mNumKVHeads * paddedKvLen;
+                sageParams.stride_bz_o = qoLen * mNumQHeads * mHeadSize;
+                sageParams.stride_seq_o = mNumQHeads * mHeadSize;
+                sageParams.stride_h_o = mHeadSize;
 
-                    SageAttentionRunner sageRunner(mDataType, runtimeBatchSize, qoLen, kvLen, mNumQHeads, mNumKVHeads,
-                        mHeadSize, mSMVersion, SageTensorLayout::kBSHD, SageMaskMode::kCausal,
-                        SageQuantGranularity::kPerWarp);
-                    sageRunner.run(sageParams, nullptr, stream);
-                    return 0;
-                }
+                SageAttentionRunner sageRunner(mDataType, runtimeBatchSize, qoLen, kvLen, mNumQHeads, mNumKVHeads,
+                    mHeadSize, mSMVersion, SageTensorLayout::kBSHD, SageMaskMode::kNone,
+                    SageQuantGranularity::kPerWarp);
+                sageRunner.run(sageParams, nullptr, stream);
+                return 0;
             }
         }
 

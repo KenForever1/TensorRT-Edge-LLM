@@ -552,3 +552,178 @@ TEST(SageAttentionTest, RuntimeKvCacheHelperBatchDecode)
     // Runtime helper path with batch > 1.
     TestSageAttentionRuntimeKvCacheHelperAccuracy(2, 512, 16, 8, 128);
 }
+
+namespace
+{
+// Verify that the SageAttention decode kernel honours device-side sequence_lengths
+// so that capacity (layout kv_len) can exceed the effective kv_len. This exercises
+// the CUDA-graph-compatible single-graph code path used by the attention plugin.
+void TestSageAttentionDeviceSeqLensAccuracy(
+    int32_t batchSize, int32_t kvCapacity, int32_t effectiveKvLen, int32_t numQoHeads, int32_t numKvHeads, int32_t headDim)
+{
+    int32_t smVersion = getSMVersion();
+    applyThorSMRenumberWAR(smVersion);
+
+    if (!SageAttentionRunner::canImplement(headDim, smVersion, DataType::kHALF))
+    {
+        GTEST_SKIP() << "SageAttention not supported for headSize=" << headDim << ", SM=" << smVersion;
+    }
+    ASSERT_LT(effectiveKvLen, kvCapacity);
+
+    constexpr int32_t kQOLen = 1;
+    size_t const qSize = static_cast<size_t>(batchSize) * kQOLen * numQoHeads * headDim;
+    size_t const kvEffSize = static_cast<size_t>(batchSize) * effectiveKvLen * numKvHeads * headDim;
+    size_t const oSize = static_cast<size_t>(batchSize) * kQOLen * numQoHeads * headDim;
+    size_t const kvCacheSize = static_cast<size_t>(batchSize) * 2 * numKvHeads * kvCapacity * headDim;
+
+    std::vector<half> qInput(qSize);
+    std::vector<half> kEffInput(kvEffSize);
+    std::vector<half> vEffInput(kvEffSize);
+    std::vector<half> kvCacheInput(kvCacheSize, __float2half(0.0f));
+    std::vector<int32_t> sequenceLengths(batchSize, effectiveKvLen);
+
+    uniformFloatInitialization(qInput, -1.0f, 1.0f);
+    uniformFloatInitialization(kEffInput, -1.0f, 1.0f);
+    uniformFloatInitialization(vEffInput, -1.0f, 1.0f);
+
+    // Populate kv cache only at [0, effectiveKvLen); positions [effectiveKvLen, kvCapacity)
+    // are left zero so we can also confirm the convert-kernel zero-fill doesn't leak through.
+    for (int32_t batch = 0; batch < batchSize; ++batch)
+    {
+        for (int32_t seq = 0; seq < effectiveKvLen; ++seq)
+        {
+            for (int32_t head = 0; head < numKvHeads; ++head)
+            {
+                for (int32_t dim = 0; dim < headDim; ++dim)
+                {
+                    int64_t const kvIdx = (((static_cast<int64_t>(batch) * effectiveKvLen + seq) * numKvHeads + head)
+                            * headDim + dim);
+                    int64_t const kCacheIdx = (((static_cast<int64_t>(batch) * 2 * numKvHeads + head) * kvCapacity + seq)
+                            * headDim + dim);
+                    int64_t const vCacheIdx
+                        = (((static_cast<int64_t>(batch) * 2 * numKvHeads + numKvHeads + head) * kvCapacity + seq)
+                              * headDim + dim);
+                    kvCacheInput[kCacheIdx] = kEffInput[kvIdx];
+                    kvCacheInput[vCacheIdx] = vEffInput[kvIdx];
+                }
+            }
+        }
+    }
+
+    rt::Tensor qTensor({batchSize, kQOLen, numQoHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kRefTensor({batchSize, effectiveKvLen, numKvHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor vRefTensor({batchSize, effectiveKvLen, numKvHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kvCacheTensor({batchSize, 2, numKvHeads, kvCapacity, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor sequenceLengthsTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    rt::Tensor oTensorRef({batchSize, kQOLen, numQoHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor oTensorSage({batchSize, kQOLen, numQoHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaMemcpy(qTensor.rawPointer(), qInput.data(), qSize * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(kRefTensor.rawPointer(), kEffInput.data(), kvEffSize * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(vRefTensor.rawPointer(), vEffInput.data(), kvEffSize * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(
+        kvCacheTensor.rawPointer(), kvCacheInput.data(), kvCacheSize * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(sequenceLengthsTensor.rawPointer(), sequenceLengths.data(),
+        sequenceLengths.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    // Reference attends only over [0, effectiveKvLen) so the SageAttention path must mask
+    // out positions [effectiveKvLen, kvCapacity) to match.
+    launchSageReferenceAttention(static_cast<half const*>(qTensor.rawPointer()),
+        static_cast<half const*>(kRefTensor.rawPointer()), static_cast<half const*>(vRefTensor.rawPointer()),
+        static_cast<half*>(oTensorRef.rawPointer()), batchSize, kQOLen, effectiveKvLen, numQoHeads, numKvHeads, headDim,
+        false, stream);
+
+    int32_t const paddedKvLen = sage::getSagePaddedKvLen(kvCapacity);
+    rt::Tensor qInt8Tensor({batchSize, kQOLen, numQoHeads, headDim}, rt::DeviceType::kGPU, DataType::kINT8);
+    rt::Tensor kInt8Tensor({batchSize, kvCapacity, numKvHeads, headDim}, rt::DeviceType::kGPU, DataType::kINT8);
+    rt::Tensor vFp8Tensor({batchSize, headDim, numKvHeads, paddedKvLen}, rt::DeviceType::kGPU, DataType::kINT8);
+    rt::Tensor qScaleTensor(
+        {sage::getSageQScaleSize(batchSize, kQOLen, numQoHeads)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor kScaleTensor(
+        {sage::getSageKScaleSize(batchSize, kvCapacity, numKvHeads)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+
+    sage::launchSageQuantizeQToInt8(qTensor, qInt8Tensor, qScaleTensor, stream);
+    sage::launchSageConvertKVCacheToInt8AndFp8(
+        kvCacheTensor, sequenceLengthsTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, kvCapacity, stream);
+
+    SageAttentionParams params;
+    params.q_ptr = static_cast<int8_t*>(qInt8Tensor.rawPointer());
+    params.k_ptr = static_cast<int8_t*>(kInt8Tensor.rawPointer());
+    params.v_ptr = static_cast<int8_t*>(vFp8Tensor.rawPointer());
+    params.o_ptr = oTensorSage.rawPointer();
+    params.q_scale_ptr = static_cast<float*>(qScaleTensor.rawPointer());
+    params.k_scale_ptr = static_cast<float*>(kScaleTensor.rawPointer());
+    params.sequence_lengths = static_cast<int32_t const*>(sequenceLengthsTensor.rawPointer());
+    params.batch_size = batchSize;
+    params.qo_len = kQOLen;
+    params.kv_len = kvCapacity;
+    params.num_qo_heads = numQoHeads;
+    params.num_kv_heads = numKvHeads;
+    params.head_dim = headDim;
+    params.tensor_layout = SageTensorLayout::kBSHD;
+    params.mask_mode = SageMaskMode::kNone;
+    params.qk_quant_gran = SageQuantGranularity::kPerWarp;
+    params.stride_bz_q = kQOLen * numQoHeads * headDim;
+    params.stride_seq_q = numQoHeads * headDim;
+    params.stride_h_q = headDim;
+    params.stride_bz_k = kvCapacity * numKvHeads * headDim;
+    params.stride_seq_k = numKvHeads * headDim;
+    params.stride_h_k = headDim;
+    params.stride_bz_v = headDim * numKvHeads * paddedKvLen;
+    params.stride_h_v = paddedKvLen;
+    params.stride_d_v = numKvHeads * paddedKvLen;
+    params.stride_bz_o = kQOLen * numQoHeads * headDim;
+    params.stride_seq_o = numQoHeads * headDim;
+    params.stride_h_o = headDim;
+
+    SageAttentionRunner runner(DataType::kHALF, batchSize, kQOLen, kvCapacity, numQoHeads, numKvHeads, headDim, smVersion,
+        SageTensorLayout::kBSHD, SageMaskMode::kNone, SageQuantGranularity::kPerWarp);
+    runner.run(params, nullptr, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaGetLastError());
+
+    std::vector<half> outRef(oSize);
+    std::vector<half> outSage(oSize);
+    CUDA_CHECK(cudaMemcpy(outRef.data(), oTensorRef.rawPointer(), oSize * sizeof(half), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(outSage.data(), oTensorSage.rawPointer(), oSize * sizeof(half), cudaMemcpyDeviceToHost));
+
+    int32_t numClose = 0;
+    float totalError = 0.0f;
+    bool nanValueDetected = false;
+    for (size_t i = 0; i < oSize; ++i)
+    {
+        float const ref = __half2float(outRef[i]);
+        float const sageOutput = __half2float(outSage[i]);
+        nanValueDetected |= std::isnan(sageOutput);
+        float const error = std::abs(ref - sageOutput);
+        totalError += error;
+        float const tolerance = std::max(std::abs(ref) * 0.10f, 0.20f);
+        if (error <= tolerance)
+        {
+            numClose++;
+        }
+    }
+
+    float const passRate = static_cast<float>(numClose) / static_cast<float>(oSize);
+    float const avgError = totalError / static_cast<float>(oSize);
+    std::cout << "SageAttention device-seq-lens test: batch=" << batchSize << " capacity=" << kvCapacity
+              << " effective_kv_len=" << effectiveKvLen << " pass_rate=" << passRate << " avg_error=" << avgError
+              << std::endl;
+
+    EXPECT_FALSE(nanValueDetected);
+    EXPECT_GT(passRate, 0.90);
+}
+} // namespace
+
+TEST(SageAttentionTest, DeviceSequenceLengthsCapacityPadded)
+{
+    // capacity (layout kv_len) > effective kv_len read from device pointer.
+    // This is the CUDA-graph-compatible decode path.
+    TestSageAttentionDeviceSeqLensAccuracy(1, /*kvCapacity=*/512, /*effectiveKvLen=*/384, 16, 8, 128);
+}
+
+TEST(SageAttentionTest, DeviceSequenceLengthsBatchCapacityPadded)
+{
+    TestSageAttentionDeviceSeqLensAccuracy(2, /*kvCapacity=*/512, /*effectiveKvLen=*/384, 16, 8, 128);
+}

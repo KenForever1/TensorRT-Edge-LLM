@@ -95,8 +95,14 @@ add_library(edgellmKernels STATIC ${KERNELS_CPP_SRCS} ${KERNELS_CU_SRCS}
 target_include_directories(edgellmKernels PRIVATE ${COMMON_INCLUDE_DIRS})
 # Apply FMHA SM exclusion definitions
 target_compile_definitions(edgellmKernels PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
-# Enable separable compilation for MoE Marlin kernel templates
-set_target_properties(edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+# Enable separable compilation for MoE Marlin kernel templates.
+# CUDA_RESOLVE_DEVICE_SYMBOLS ON bakes the device-link result into the static
+# archive so consumers (e.g. exampleUtils, NvInfer_edgellm_plugin) do not need
+# to re-run device linking, which would otherwise fail to resolve __fatbinwrap_*
+# symbols emitted by rdc-compiled translation units such as sageAttentionKernels.cu.
+set_target_properties(
+  edgellmKernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON
+                            CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 file(GLOB_RECURSE TOKENIZER_CPP_SRCS "tokenizer/*.cpp")
 
@@ -117,8 +123,14 @@ target_include_directories(edgellmCore PRIVATE ${COMMON_INCLUDE_DIRS})
 target_link_libraries(edgellmCore PRIVATE dl)
 # Apply FMHA SM exclusion definitions
 target_compile_definitions(edgellmCore PRIVATE ${FMHA_EXCLUDE_DEFINITIONS})
-# Enable separable compilation for MoE Marlin kernel templates
-set_target_properties(edgellmCore PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+# Enable separable compilation for MoE Marlin kernel templates.
+# CUDA_RESOLVE_DEVICE_SYMBOLS ON bakes the device-link result into the static
+# archive so consumers (e.g. exampleUtils, llm_inference) do not need to re-run
+# device linking, which would otherwise fail to resolve __fatbinwrap_* symbols
+# emitted by rdc-compiled translation units such as sageAttentionKernels.cu.
+set_target_properties(
+  edgellmCore PROPERTIES CUDA_SEPARABLE_COMPILATION ON
+                         CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
 # Generate builder C++ static library
 file(GLOB_RECURSE BUILDER_CPP_SRCS "builder/*.cpp")

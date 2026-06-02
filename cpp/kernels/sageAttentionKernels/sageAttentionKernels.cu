@@ -71,7 +71,7 @@ void launchSageAttentionSm89Kernel(SageAttentionParams& params, size_t smemSize,
 
     kernelFunc<<<gridSize, blockSize, smemSize, stream>>>(params.q_ptr, params.k_ptr, params.v_ptr,
         static_cast<DTypeOut*>(params.o_ptr), params.lse_ptr, params.q_scale_ptr, params.k_scale_ptr,
-        params.v_scale_ptr, params.v_mean_ptr, static_cast<uint32_t>(params.qo_len),
+        params.v_scale_ptr, params.v_mean_ptr, params.sequence_lengths, static_cast<uint32_t>(params.qo_len),
         static_cast<uint32_t>(params.kv_len), numKvGroups, static_cast<uint32_t>(params.stride_bz_q),
         static_cast<uint32_t>(params.stride_seq_q), static_cast<uint32_t>(params.stride_h_q),
         static_cast<uint32_t>(params.stride_bz_k), static_cast<uint32_t>(params.stride_seq_k),
