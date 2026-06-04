@@ -288,10 +288,14 @@ void TestSageAttentionRuntimeKvCacheHelperAccuracy(
         DataType::kFLOAT);
     rt::Tensor kScaleTensor(
         {sage::getSageKScaleSize(batchSize, kvLen, numKvHeads)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor vScaleTensor(
+        {sage::getSageVScaleSize(batchSize, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor kMeanTensor(
+        {sage::getSageVScaleSize(batchSize, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
 
     sage::launchSageQuantizeQToInt8(qTensor, qInt8Tensor, qScaleTensor, stream);
     sage::launchSageConvertKVCacheToInt8AndFp8(
-        kvCacheTensor, sequenceLengthsTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, kvLen, stream);
+        kvCacheTensor, sequenceLengthsTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, vScaleTensor, kMeanTensor, kvLen, stream);
 
     // ----- DIAGNOSTIC: produce reference K-Int8/V-Fp8 with the proven test kernels and compare -----
     rt::Tensor kInt8Ref({batchSize, kvLen, numKvHeads, headDim}, rt::DeviceType::kGPU, DataType::kINT8);
@@ -400,6 +404,8 @@ void TestSageAttentionRuntimeKvCacheHelperAccuracy(
     params.o_ptr = oTensorSage.rawPointer();
     params.q_scale_ptr = static_cast<float*>(qScaleTensor.rawPointer());
     params.k_scale_ptr = static_cast<float*>(kScaleTensor.rawPointer());
+    params.v_scale_ptr = static_cast<float*>(vScaleTensor.rawPointer());
+    params.fuse_v_scale = true;
     params.batch_size = batchSize;
     params.qo_len = kQOLen;
     params.kv_len = kvLen;
@@ -642,10 +648,14 @@ void TestSageAttentionDeviceSeqLensAccuracy(
         {sage::getSageQScaleSize(batchSize, kQOLen, numQoHeads)}, rt::DeviceType::kGPU, DataType::kFLOAT);
     rt::Tensor kScaleTensor(
         {sage::getSageKScaleSize(batchSize, kvCapacity, numKvHeads)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor vScaleTensor(
+        {sage::getSageVScaleSize(batchSize, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor kMeanTensor(
+        {sage::getSageVScaleSize(batchSize, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
 
     sage::launchSageQuantizeQToInt8(qTensor, qInt8Tensor, qScaleTensor, stream);
     sage::launchSageConvertKVCacheToInt8AndFp8(
-        kvCacheTensor, sequenceLengthsTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, kvCapacity, stream);
+        kvCacheTensor, sequenceLengthsTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, vScaleTensor, kMeanTensor, kvCapacity, stream);
 
     SageAttentionParams params;
     params.q_ptr = static_cast<int8_t*>(qInt8Tensor.rawPointer());
@@ -654,6 +664,8 @@ void TestSageAttentionDeviceSeqLensAccuracy(
     params.o_ptr = oTensorSage.rawPointer();
     params.q_scale_ptr = static_cast<float*>(qScaleTensor.rawPointer());
     params.k_scale_ptr = static_cast<float*>(kScaleTensor.rawPointer());
+    params.v_scale_ptr = static_cast<float*>(vScaleTensor.rawPointer());
+    params.fuse_v_scale = true;
     params.sequence_lengths = static_cast<int32_t const*>(sequenceLengthsTensor.rawPointer());
     params.batch_size = batchSize;
     params.qo_len = kQOLen;

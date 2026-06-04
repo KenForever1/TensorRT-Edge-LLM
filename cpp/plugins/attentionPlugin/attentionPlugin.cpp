@@ -630,6 +630,12 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
             rt::Coords{sage::getSageKScaleSize(static_cast<int32_t>(maxBatchSize), static_cast<int32_t>(maxKVCacheCapacity),
                 mNumKVHeads)},
             DataType::kFLOAT);
+        workspaceSize = accumulateWorkspaceSize(workspaceSize,
+            rt::Coords{sage::getSageVScaleSize(static_cast<int32_t>(maxBatchSize), mNumKVHeads, mHeadSize)},
+            DataType::kFLOAT);
+        workspaceSize = accumulateWorkspaceSize(workspaceSize,
+            rt::Coords{sage::getSageVScaleSize(static_cast<int32_t>(maxBatchSize), mNumKVHeads, mHeadSize)},
+            DataType::kFLOAT); // kMean: same size as vScale
     }
 
     // Request another alignment size to align the workspace pointer.
@@ -891,6 +897,10 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                     {sage::getSageQScaleSize(runtimeBatchSize, qoLen, mNumQHeads)}, DataType::kFLOAT);
                 rt::Tensor kScaleTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
                     {sage::getSageKScaleSize(runtimeBatchSize, kvLen, mNumKVHeads)}, DataType::kFLOAT);
+                rt::Tensor vScaleTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                    {sage::getSageVScaleSize(runtimeBatchSize, mNumKVHeads, mHeadSize)}, DataType::kFLOAT);
+                rt::Tensor kMeanTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                    {sage::getSageVScaleSize(runtimeBatchSize, mNumKVHeads, mHeadSize)}, DataType::kFLOAT);
                 // sequence_lengths == contextLengthTensor: contextLength already equals the number
                 // of valid KV tokens INCLUDING the new decode write performed by applyRopeWriteKV
                 // above (which writes at slot contextLength-1). Sage's convert kernel and attention
@@ -898,7 +908,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                 // contextLengthTensor directly (no +qoLen — that would be off-by-one).
                 sage::launchSageQuantizeQToInt8(qInputTensor, qInt8Tensor, qScaleTensor, stream);
                 sage::launchSageConvertKVCacheToInt8AndFp8(
-                    kvCacheTensor, contextLengthTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, kvLen, stream);
+                    kvCacheTensor, contextLengthTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, vScaleTensor, kMeanTensor, kvLen, stream);
 
                 SageAttentionParams sageParams{};
                 sageParams.q_ptr = qInt8Tensor.dataPointer<int8_t>();
@@ -907,6 +917,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                 sageParams.o_ptr = attentionOutputTensor.rawPointer();
                 sageParams.q_scale_ptr = qScaleTensor.dataPointer<float>();
                 sageParams.k_scale_ptr = kScaleTensor.dataPointer<float>();
+                sageParams.v_scale_ptr = vScaleTensor.dataPointer<float>();
+                sageParams.fuse_v_scale = true;
                 sageParams.sequence_lengths = contextLengthTensor.dataPointer<int32_t>();
                 sageParams.batch_size = runtimeBatchSize;
                 sageParams.qo_len = qoLen;

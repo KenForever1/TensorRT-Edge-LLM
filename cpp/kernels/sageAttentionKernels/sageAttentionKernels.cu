@@ -32,7 +32,7 @@ namespace sage
 namespace
 {
 
-template<int32_t HEAD_DIM, bool IS_CAUSAL, int32_t QK_QUANT_GRAN, bool RETURN_LSE, typename DTypeOut>
+template<int32_t HEAD_DIM, bool IS_CAUSAL, int32_t QK_QUANT_GRAN, bool RETURN_LSE, typename DTypeOut, bool FUSE_V_SCALE>
 void launchSageAttentionSm89Kernel(SageAttentionParams& params, size_t smemSize, cudaStream_t stream)
 {
     constexpr int32_t CTA_Q = 128;
@@ -49,7 +49,6 @@ void launchSageAttentionSm89Kernel(SageAttentionParams& params, size_t smemSize,
     constexpr MaskMode maskMode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
     using DTypeSVAccum = float;
     constexpr bool USE_INST_BUFFER = false;
-    constexpr bool FUSE_V_SCALE = false;
     constexpr bool FUSE_V_MEAN = false;
     constexpr bool USE_PV_FP16_ACCU = false;
 
@@ -81,6 +80,21 @@ void launchSageAttentionSm89Kernel(SageAttentionParams& params, size_t smemSize,
         static_cast<uint32_t>(params.stride_h_o), params.sm_scale);
 }
 
+template<int32_t HEAD_DIM, bool IS_CAUSAL, int32_t QK_QUANT_GRAN, bool RETURN_LSE, typename DTypeOut>
+void launchSageAttentionSm89Dispatched(SageAttentionParams& params, size_t smemSize, cudaStream_t stream)
+{
+    if (params.fuse_v_scale)
+    {
+        launchSageAttentionSm89Kernel<HEAD_DIM, IS_CAUSAL, QK_QUANT_GRAN, RETURN_LSE, DTypeOut, true>(
+            params, smemSize, stream);
+    }
+    else
+    {
+        launchSageAttentionSm89Kernel<HEAD_DIM, IS_CAUSAL, QK_QUANT_GRAN, RETURN_LSE, DTypeOut, false>(
+            params, smemSize, stream);
+    }
+}
+
 } // namespace
 
 template<int32_t HEAD_DIM, bool IS_CAUSAL, int32_t QK_QUANT_GRAN, bool RETURN_LSE, typename DTypeOut>
@@ -95,9 +109,12 @@ void launchSageAttentionKernel(
     (void) gridSizeX;
     (void) gridSizeY;
     (void) gridSizeZ;
-    launchSageAttentionSm89Kernel<HEAD_DIM, IS_CAUSAL, QK_QUANT_GRAN, RETURN_LSE, DTypeOut>(
+    launchSageAttentionSm89Dispatched<HEAD_DIM, IS_CAUSAL, QK_QUANT_GRAN, RETURN_LSE, DTypeOut>(
         params, smemSize, stream);
 }
+
+// Instantiations for head_dim=64, 128, 256 × causal/non-causal × per_warp/per_thread × return_lse/none × FP16
+// The fuse_v_scale dispatch happens at runtime inside launchSageAttentionSm89Dispatched
 
 template void launchSageAttentionKernel<64, true, 2, false, half>(
     SageAttentionParams&, int32_t, int32_t, int32_t, size_t, cudaStream_t);

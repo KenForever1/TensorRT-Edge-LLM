@@ -36,12 +36,19 @@ int32_t getSageQScaleSize(int32_t batchSize, int32_t qoLen, int32_t numHeads) no
 //! \brief Get K per-warp scale tensor size for SageAttention runtime quantization.
 int32_t getSageKScaleSize(int32_t batchSize, int32_t kvLen, int32_t numHeads) noexcept;
 
+//! \brief Get V per-channel scale tensor size for SageAttention runtime quantization.
+int32_t getSageVScaleSize(int32_t batchSize, int32_t numKVHeads, int32_t headDim) noexcept;
+
 //! \brief Quantize FP16 Q tensor in BSHD layout to INT8 with SageAttention per-warp scales.
 void launchSageQuantizeQToInt8(rt::Tensor const& q, rt::Tensor& qInt8, rt::Tensor& qScale, cudaStream_t stream);
 
-//! \brief Convert FP16 KV cache into SageAttention INT8 K and FP8 transposed V tensors.
+//! \brief Convert FP16 KV cache into SageAttention INT8 K and FP8 transposed V tensors
+//! with per-channel V scaling and K-mean centering (smooth_k).
+//! vScale: [batchSize, numKVHeads, headDim] — per-channel V scales.
+//! kMean:  [batchSize, numKVHeads, headDim] — per-channel K means.
 void launchSageConvertKVCacheToInt8AndFp8(rt::Tensor const& kvCache, rt::Tensor const& sequenceLengths,
-    rt::Tensor& kInt8, rt::Tensor& vFp8, rt::Tensor& kScale, int32_t kvLen, cudaStream_t stream);
+    rt::Tensor& kInt8, rt::Tensor& vFp8, rt::Tensor& kScale, rt::Tensor& vScale, rt::Tensor& kMean,
+    int32_t kvLen, cudaStream_t stream);
 
 } // namespace sage
 } // namespace trt_edgellm
