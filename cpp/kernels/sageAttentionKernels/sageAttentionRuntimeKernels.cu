@@ -124,6 +124,9 @@ __global__ void quantizeBshdToInt8PerWarpKernel(half const* input, int8_t* outpu
 }
 
 // Kernel to compute per-channel V scales and K-means over valid sequence positions.
+// Each thread handles one (batch, head, dim) element with serial reduction over seq.
+// This is efficient because: (a) memory access is coalesced when threads read the same
+// seq position for different dims, (b) no shared memory or sync overhead.
 __global__ void computePerChannelStatsKernel(half const* kvCache, int32_t const* sequenceLengths,
     float* vScale, float* kMean, int32_t const batchSize, int32_t const numKVHeads, int32_t const headDim,
     int32_t const capacity)
@@ -141,17 +144,13 @@ __global__ void computePerChannelStatsKernel(half const* kvCache, int32_t const*
     float sumK = 0.0F;
     for (int32_t s = 0; s < effectiveKvLen; ++s)
     {
-        // K cache at kvCache[batch][0][head][s][dim]
-        int64_t const kCacheIdx = (((static_cast<int64_t>(batch) * 2 * numKVHeads + head) * capacity + s) * headDim + dim);
-        sumK += __half2float(kvCache[kCacheIdx]);
-        // V cache at kvCache[batch][1][head][s][dim]
-        int64_t const vCacheIdx = (((static_cast<int64_t>(batch) * 2 * numKVHeads + numKVHeads + head) * capacity + s) * headDim + dim);
-        maxAbsV = fmaxf(maxAbsV, fabsf(__half2float(kvCache[vCacheIdx])));
+        int64_t const kIdx = (((static_cast<int64_t>(batch) * 2 * numKVHeads + head) * capacity + s) * headDim + dim);
+        int64_t const vIdx = (((static_cast<int64_t>(batch) * 2 * numKVHeads + numKVHeads + head) * capacity + s) * headDim + dim);
+        sumK += __half2float(kvCache[kIdx]);
+        maxAbsV = fmaxf(maxAbsV, fabsf(__half2float(kvCache[vIdx])));
     }
     float const count = static_cast<float>(effectiveKvLen > 0 ? effectiveKvLen : 1);
-    // K mean: mean over sequence dim
     kMean[idx] = sumK / count;
-    // V scale: scale = max(|V|) / 448.0; V_fp8 = fp8(V / scale); kernel does O *= scale
     vScale[idx] = fmaxf(maxAbsV / kFP8_MAX, kMIN_SCALE);
 }
 
@@ -313,7 +312,7 @@ void launchSageConvertKVCacheToInt8AndFp8(rt::Tensor const& kvCache, rt::Tensor 
     check::check(kScale.getDataType() == nvinfer1::DataType::kFLOAT, "SageAttention K scale must be FP32.");
     check::check(kvLen <= capacity, "SageAttention KV length must not exceed KV cache capacity.");
 
-    // First, compute per-channel V scales and K-means in one pass
+    // First, compute per-channel V scales and K-means.
     int32_t const perChannelSize = getSageVScaleSize(batchSize, numKVHeads, headDim);
     int32_t const statBlocks = (perChannelSize + kSAGE_THREADS_PER_BLOCK - 1) / kSAGE_THREADS_PER_BLOCK;
     computePerChannelStatsKernel<<<statBlocks, kSAGE_THREADS_PER_BLOCK, 0, stream>>>(
@@ -322,9 +321,16 @@ void launchSageConvertKVCacheToInt8AndFp8(rt::Tensor const& kvCache, rt::Tensor 
         vScale.dataPointer<float>(), kMean.dataPointer<float>(),
         batchSize, numKVHeads, headDim, capacity);
 
-    // Zero out V-FP8 tensor (padding area)
-    CUDA_CHECK(cudaMemsetAsync(vFp8.rawPointer(), 0,
-        static_cast<size_t>(batchSize) * headDim * numKVHeads * paddedKvLen * sizeof(int8_t), stream));
+    // Zero out V-FP8 tensor padding area (only beyond kvLen).
+    // When kvLen == paddedKvLen (kvLen is multiple of CTA_K), no memset needed.
+    if (paddedKvLen > kvLen)
+    {
+        int32_t const vFp8Numel = static_cast<int32_t>(batchSize) * headDim * numKVHeads * paddedKvLen;
+        int32_t const kvLenRegion = static_cast<int32_t>(batchSize) * headDim * numKVHeads * kvLen;
+        int32_t const padBytes = (vFp8Numel - kvLenRegion) * static_cast<int32_t>(sizeof(int8_t));
+        CUDA_CHECK(cudaMemsetAsync(
+            static_cast<int8_t*>(vFp8.rawPointer()) + kvLenRegion, 0, padBytes, stream));
+    }
     // Convert KV cache to SageAttention quantized format with V scaling and K-mean centering
     float const* vScalePtr = vScale.isEmpty() ? nullptr : vScale.dataPointer<float>();
     float const* kMeanPtr = kMean.isEmpty() ? nullptr : kMean.dataPointer<float>();
