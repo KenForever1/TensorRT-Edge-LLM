@@ -292,10 +292,14 @@ void TestSageAttentionRuntimeKvCacheHelperAccuracy(
         {sage::getSageVScaleSize(batchSize, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
     rt::Tensor kMeanTensor(
         {sage::getSageVScaleSize(batchSize, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor partialVMaxTensor(
+        {sage::getSageStatsPartialsSize(batchSize, kvLen, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor partialKSumTensor(
+        {sage::getSageStatsPartialsSize(batchSize, kvLen, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
 
     sage::launchSageQuantizeQToInt8(qTensor, qInt8Tensor, qScaleTensor, stream);
     sage::launchSageConvertKVCacheToInt8AndFp8(
-        kvCacheTensor, sequenceLengthsTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, vScaleTensor, kMeanTensor, kvLen, stream);
+        kvCacheTensor, sequenceLengthsTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, vScaleTensor, kMeanTensor, partialVMaxTensor, partialKSumTensor, kvLen, stream);
 
     // ----- DIAGNOSTIC: produce reference K-Int8/V-Fp8 with the proven test kernels and compare -----
     rt::Tensor kInt8Ref({batchSize, kvLen, numKvHeads, headDim}, rt::DeviceType::kGPU, DataType::kINT8);
@@ -652,10 +656,14 @@ void TestSageAttentionDeviceSeqLensAccuracy(
         {sage::getSageVScaleSize(batchSize, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
     rt::Tensor kMeanTensor(
         {sage::getSageVScaleSize(batchSize, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor partialVMaxTensor(
+        {sage::getSageStatsPartialsSize(batchSize, kvCapacity, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor partialKSumTensor(
+        {sage::getSageStatsPartialsSize(batchSize, kvCapacity, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
 
     sage::launchSageQuantizeQToInt8(qTensor, qInt8Tensor, qScaleTensor, stream);
     sage::launchSageConvertKVCacheToInt8AndFp8(
-        kvCacheTensor, sequenceLengthsTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, vScaleTensor, kMeanTensor, kvCapacity, stream);
+        kvCacheTensor, sequenceLengthsTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, vScaleTensor, kMeanTensor, partialVMaxTensor, partialKSumTensor, kvCapacity, stream);
 
     SageAttentionParams params;
     params.q_ptr = static_cast<int8_t*>(qInt8Tensor.rawPointer());

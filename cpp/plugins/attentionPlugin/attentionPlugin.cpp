@@ -636,6 +636,15 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
         workspaceSize = accumulateWorkspaceSize(workspaceSize,
             rt::Coords{sage::getSageVScaleSize(static_cast<int32_t>(maxBatchSize), mNumKVHeads, mHeadSize)},
             DataType::kFLOAT); // kMean: same size as vScale
+        // Partials buffers for fused stats: per-warp-block V max and K sum.
+        workspaceSize = accumulateWorkspaceSize(workspaceSize,
+            rt::Coords{sage::getSageStatsPartialsSize(static_cast<int32_t>(maxBatchSize),
+                static_cast<int32_t>(maxKVCacheCapacity), mNumKVHeads, mHeadSize)},
+            DataType::kFLOAT);
+        workspaceSize = accumulateWorkspaceSize(workspaceSize,
+            rt::Coords{sage::getSageStatsPartialsSize(static_cast<int32_t>(maxBatchSize),
+                static_cast<int32_t>(maxKVCacheCapacity), mNumKVHeads, mHeadSize)},
+            DataType::kFLOAT);
     }
 
     // Request another alignment size to align the workspace pointer.
@@ -901,6 +910,10 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                     {sage::getSageVScaleSize(runtimeBatchSize, mNumKVHeads, mHeadSize)}, DataType::kFLOAT);
                 rt::Tensor kMeanTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
                     {sage::getSageVScaleSize(runtimeBatchSize, mNumKVHeads, mHeadSize)}, DataType::kFLOAT);
+                rt::Tensor partialVMaxTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                    {sage::getSageStatsPartialsSize(runtimeBatchSize, kvLen, mNumKVHeads, mHeadSize)}, DataType::kFLOAT);
+                rt::Tensor partialKSumTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                    {sage::getSageStatsPartialsSize(runtimeBatchSize, kvLen, mNumKVHeads, mHeadSize)}, DataType::kFLOAT);
                 // sequence_lengths == contextLengthTensor: contextLength already equals the number
                 // of valid KV tokens INCLUDING the new decode write performed by applyRopeWriteKV
                 // above (which writes at slot contextLength-1). Sage's convert kernel and attention
@@ -908,7 +921,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                 // contextLengthTensor directly (no +qoLen — that would be off-by-one).
                 sage::launchSageQuantizeQToInt8(qInputTensor, qInt8Tensor, qScaleTensor, stream);
                 sage::launchSageConvertKVCacheToInt8AndFp8(
-                    kvCacheTensor, contextLengthTensor, kInt8Tensor, vFp8Tensor, kScaleTensor, vScaleTensor, kMeanTensor, kvLen, stream);
+                    kvCacheTensor, contextLengthTensor, kInt8Tensor, vFp8Tensor, kScaleTensor,
+                    vScaleTensor, kMeanTensor, partialVMaxTensor, partialKSumTensor, kvLen, stream);
 
                 SageAttentionParams sageParams{};
                 sageParams.q_ptr = qInt8Tensor.dataPointer<int8_t>();

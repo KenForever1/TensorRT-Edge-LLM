@@ -39,16 +39,24 @@ int32_t getSageKScaleSize(int32_t batchSize, int32_t kvLen, int32_t numHeads) no
 //! \brief Get V per-channel scale tensor size for SageAttention runtime quantization.
 int32_t getSageVScaleSize(int32_t batchSize, int32_t numKVHeads, int32_t headDim) noexcept;
 
+//! \brief Get partial stats buffer size for fused stats optimization.
+//! Each warp-block of the fused convert kernel writes one partial V-max and K-sum per dim.
+int32_t getSageStatsPartialsSize(int32_t batchSize, int32_t kvLen, int32_t numKVHeads, int32_t headDim) noexcept;
+
 //! \brief Quantize FP16 Q tensor in BSHD layout to INT8 with SageAttention per-warp scales.
 void launchSageQuantizeQToInt8(rt::Tensor const& q, rt::Tensor& qInt8, rt::Tensor& qScale, cudaStream_t stream);
 
 //! \brief Convert FP16 KV cache into SageAttention INT8 K and FP8 transposed V tensors
 //! with per-channel V scaling and K-mean centering (smooth_k).
+//! Uses fused approach: convert kernel reads KV cache once, writes partial stats,
+//! followed by reduction and adjustment kernels.
 //! vScale: [batchSize, numKVHeads, headDim] — per-channel V scales.
 //! kMean:  [batchSize, numKVHeads, headDim] — per-channel K means.
+//! partialVMax: [batchSize, numKVHeads, headDim, numBlocks] — per-warp-block V max partials.
+//! partialKSum: [batchSize, numKVHeads, headDim, numBlocks] — per-warp-block K sum partials.
 void launchSageConvertKVCacheToInt8AndFp8(rt::Tensor const& kvCache, rt::Tensor const& sequenceLengths,
     rt::Tensor& kInt8, rt::Tensor& vFp8, rt::Tensor& kScale, rt::Tensor& vScale, rt::Tensor& kMean,
-    int32_t kvLen, cudaStream_t stream);
+    rt::Tensor& partialVMax, rt::Tensor& partialKSum, int32_t kvLen, cudaStream_t stream);
 
 } // namespace sage
 } // namespace trt_edgellm
