@@ -892,9 +892,10 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             // and the SageAttention kernel (padding-mask via seq_lens) consume.
             bool const useSageDecode = canUseSageDecode(executionMode, runtimeSeqLen, mSMVersion, mDataType, mHeadSize,
                 mNumQHeads, mNumKVHeads, mSlidingWindowSize, mEnableTreeAttention, mEnableFp8KVCache);
-            // Fused kernel (loads K/V from cache, Plan 1)
-            if (false && useSageDecode && kvCacheCapacity > 0 && mHeadSize == 128)
+            // Fused SageAttention: loads K/V from cache, quantizes in smem
+            if (useSageDecode && kvCacheCapacity > 0 && mHeadSize == 128)
             {
+            printf("FUSED_BLOCK_ENTERED\n"); fflush(stdout);
                 int32_t const qoLen = runtimeSeqLen;
                 rt::Tensor qInt8Tensor = assignTensorFromWorkspace(
                     alignedWorkspacePtr, {runtimeBatchSize, qoLen, mNumQHeads, mHeadSize}, DataType::kINT8);
@@ -916,7 +917,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                     contextLengthTensor.dataPointer<int32_t>(),
                     runtimeBatchSize, mNumQHeads, mNumKVHeads, kvCacheCapacity,
                     strideBzQ, strideSeqQ, mHeadSize, strideBzQ, strideSeqQ, mHeadSize, smScale, stream);
-                { static int dc=0; if(dc<1){ CUDA_CHECK(cudaStreamSynchronize(stream)); int oS=runtimeBatchSize*qoLen*mNumQHeads*mHeadSize; std::vector<int8_t> q(oS); std::vector<half> o(oS); CUDA_CHECK(cudaMemcpy(q.data(),qInt8Tensor.rawPointer(),oS,cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(o.data(),attentionOutputTensor.rawPointer(),oS*2,cudaMemcpyDeviceToHost)); LOG_INFO("FUSED_DBG L%d: Q=%d,%d,%d,%d Out=%.4f,%.4f,%.4f,%.4f",dc,(int)q[0],(int)q[1],(int)q[2],(int)q[3],__half2float(o[0]),__half2float(o[1]),__half2float(o[2]),__half2float(o[3])); dc++; } }
+                printf("FUSED_DBG_REACHED\n"); fflush(stdout);
+                { static int dc=0; if(dc<2){ dc++; CUDA_CHECK(cudaStreamSynchronize(stream)); int oS=runtimeBatchSize*qoLen*mNumQHeads*mHeadSize; std::vector<int8_t> qi(oS); std::vector<float> qs(32); std::vector<half> qf(oS); std::vector<half> oh(oS); CUDA_CHECK(cudaMemcpy(qi.data(),qInt8Tensor.rawPointer(),oS,cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(qs.data(),qScaleTensor.rawPointer(),128,cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(qf.data(),qInputTensor.rawPointer(),oS*2,cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(oh.data(),attentionOutputTensor.rawPointer(),oS*2,cudaMemcpyDeviceToHost)); LOG_INFO("FUSED L%d: Q_FP16=%.4f,%.4f QS=%.6f Q_I8=%d,%d,%d,%d Q_expected=%.4f,%.4f Out=%.4f,%.4f",dc-1,__half2float(qf[0]),__half2float(qf[1]),qs[0],(int)qi[0],(int)qi[1],(int)qi[2],(int)qi[3],(float)(int)qi[0]*qs[0],(float)(int)qi[1]*qs[1],__half2float(oh[0]),__half2float(oh[1])); } }
                 return 0;
             }
         }
