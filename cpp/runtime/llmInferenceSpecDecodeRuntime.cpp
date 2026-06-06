@@ -1931,6 +1931,8 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelAcceptToken(SpecDecodeInference
 
 bool LLMInferenceSpecDecodeRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
 {
+    return false;
+    LOG_INFO("Graph SKIPPED for fused debug");
 
     bool draftProposalCaptureStatus{true};
     bool draftAcceptCaptureStatus{true};

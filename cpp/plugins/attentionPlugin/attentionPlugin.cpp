@@ -43,6 +43,7 @@
 #include <mutex>
 #include <optional>
 #include <vector>
+#include <fstream>
 
 using namespace nvinfer1;
 
@@ -892,7 +893,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             bool const useSageDecode = canUseSageDecode(executionMode, runtimeSeqLen, mSMVersion, mDataType, mHeadSize,
                 mNumQHeads, mNumKVHeads, mSlidingWindowSize, mEnableTreeAttention, mEnableFp8KVCache);
             // Fused kernel (loads K/V from cache, Plan 1)
-            if (useSageDecode && kvCacheCapacity > 0 && mHeadSize == 128)
+            if (false && useSageDecode && kvCacheCapacity > 0 && mHeadSize == 128)
             {
                 int32_t const qoLen = runtimeSeqLen;
                 rt::Tensor qInt8Tensor = assignTensorFromWorkspace(
@@ -915,6 +916,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                     contextLengthTensor.dataPointer<int32_t>(),
                     runtimeBatchSize, mNumQHeads, mNumKVHeads, kvCacheCapacity,
                     strideBzQ, strideSeqQ, mHeadSize, strideBzQ, strideSeqQ, mHeadSize, smScale, stream);
+                { static int dc=0; if(dc<1){ CUDA_CHECK(cudaStreamSynchronize(stream)); int oS=runtimeBatchSize*qoLen*mNumQHeads*mHeadSize; std::vector<int8_t> q(oS); std::vector<half> o(oS); CUDA_CHECK(cudaMemcpy(q.data(),qInt8Tensor.rawPointer(),oS,cudaMemcpyDeviceToHost)); CUDA_CHECK(cudaMemcpy(o.data(),attentionOutputTensor.rawPointer(),oS*2,cudaMemcpyDeviceToHost)); LOG_INFO("FUSED_DBG L%d: Q=%d,%d,%d,%d Out=%.4f,%.4f,%.4f,%.4f",dc,(int)q[0],(int)q[1],(int)q[2],(int)q[3],__half2float(o[0]),__half2float(o[1]),__half2float(o[2]),__half2float(o[3])); dc++; } }
                 return 0;
             }
         }
@@ -928,6 +930,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             params.vScale = vScale;
         }
         params.output = attentionOutputTensor.dataPointer<half>();
+                { static int dx=0; if(dx<1){ CUDA_CHECK(cudaStreamSynchronize(stream)); int oS=runtimeBatchSize*1*mNumQHeads*mHeadSize; std::vector<half> o(oS); CUDA_CHECK(cudaMemcpy(o.data(),attentionOutputTensor.rawPointer(),oS*2,cudaMemcpyDeviceToHost)); LOG_INFO("XQA_DBG L%d: Out=%.4f,%.4f,%.4f,%.4f",dx,__half2float(o[0]),__half2float(o[1]),__half2float(o[2]),__half2float(o[3])); dx++; } }
         params.qInputPtr = qInputTensor.dataPointer<half>();
         params.kvCache.data = kvCacheTensor.rawPointer();
         params.kvCache.sequence_lengths = contextLengthTensor.dataPointer<int32_t>();
@@ -943,6 +946,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         {
             // Execute vanilla decoding.
             xqaRunner.dispatchXQAKernel(params, stream);
+                { static int dx=0; if(dx<1){ CUDA_CHECK(cudaStreamSynchronize(stream)); int oS=runtimeBatchSize*1*mNumQHeads*mHeadSize; std::vector<half> o(oS); CUDA_CHECK(cudaMemcpy(o.data(),attentionOutputTensor.rawPointer(),oS*2,cudaMemcpyDeviceToHost)); LOG_INFO("XQA_DBG L%d: Out=%.4f,%.4f,%.4f,%.4f",dx,__half2float(o[0]),__half2float(o[1]),__half2float(o[2]),__half2float(o[3])); dx++; } }
         }
     }
     return 0;
