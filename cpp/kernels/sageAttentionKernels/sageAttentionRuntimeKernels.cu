@@ -238,7 +238,10 @@ __global__ void computePerChannelStatsKernel(half const* kvCache, int32_t const*
         maxAbsV = fmaxf(maxAbsV, fabsf(__half2float(kvCache[vIdx])));
     }
     float const count = static_cast<float>(effectiveKvLen > 0 ? effectiveKvLen : 1);
-    kMean[idx] = sumK / count;
+    if (kMean != nullptr)
+    {
+        kMean[idx] = sumK / count;
+    }
     vScale[idx] = fmaxf(maxAbsV / kFP8_MAX, kMIN_SCALE);
 }
 
@@ -261,6 +264,19 @@ __global__ void convertKvCacheToSageKernelFused(half const* kvCache, int32_t con
     int32_t const batch = scaleIdx / (numWarpsPerBlock * numBlocks * numHeads);
     int32_t const effectiveKvLen = sequenceLengths == nullptr ? kvLen : min(sequenceLengths[batch], kvLen);
     int32_t const seqBegin = blockSeq * kSAGE_CTA_K + warpInBlock * kSAGE_WARP_K;
+
+    // Early-exit: if entire block is beyond effective KV range, skip all work.
+    // The attention kernel only iterates over ceil(effectiveKvLen / CTA_K) tiles,
+    // so K/V values and kScale for padding blocks are never read.
+    if (seqBegin >= effectiveKvLen)
+    {
+        if (threadIdx.x == 0)
+        {
+            kScale[scaleIdx] = kMIN_SCALE;
+        }
+        return;
+    }
+
     int32_t const seqEnd = min(seqBegin + kSAGE_WARP_K, effectiveKvLen);
     int32_t const halfHeadDim = headDim / 2;
 
@@ -660,6 +676,40 @@ void launchSageConvertKVCacheToInt8AndFp8(rt::Tensor const& kvCache, rt::Tensor 
         CUDA_CHECK(cudaMemsetAsync(
             static_cast<int8_t*>(vFp8.rawPointer()) + kvLenRegion, 0, padBytes, stream));
     }
+}
+
+void launchSageComputeVChannelScales(rt::Tensor const& kvCache, rt::Tensor const& sequenceLengths,
+    rt::Tensor& vScale, int32_t kvLen, cudaStream_t stream)
+{
+    rt::Coords const kvCacheShape = kvCache.getShape();
+    int32_t const batchSize = static_cast<int32_t>(kvCacheShape[0]);
+    int32_t const numKVHeads = static_cast<int32_t>(kvCacheShape[2]);
+    int32_t const capacity = static_cast<int32_t>(kvCacheShape[3]);
+    int32_t const headDim = static_cast<int32_t>(kvCacheShape[4]);
+    int32_t const perChannelSize = getSageVScaleSize(batchSize, numKVHeads, headDim);
+    int32_t const statBlocks = (perChannelSize + kSAGE_THREADS_PER_BLOCK - 1) / kSAGE_THREADS_PER_BLOCK;
+
+    computePerChannelStatsKernel<<<statBlocks, kSAGE_THREADS_PER_BLOCK, 0, stream>>>(
+        kvCache.dataPointer<half>(),
+        sequenceLengths.isEmpty() ? nullptr : sequenceLengths.dataPointer<int32_t>(),
+        vScale.dataPointer<float>(), nullptr, batchSize, numKVHeads, headDim, capacity);
+}
+
+void launchSageComputeVScalesAndKMeans(rt::Tensor const& kvCache, rt::Tensor const& sequenceLengths,
+    rt::Tensor& vScale, rt::Tensor& kMean, int32_t kvLen, cudaStream_t stream)
+{
+    rt::Coords const kvCacheShape = kvCache.getShape();
+    int32_t const batchSize = static_cast<int32_t>(kvCacheShape[0]);
+    int32_t const numKVHeads = static_cast<int32_t>(kvCacheShape[2]);
+    int32_t const capacity = static_cast<int32_t>(kvCacheShape[3]);
+    int32_t const headDim = static_cast<int32_t>(kvCacheShape[4]);
+    int32_t const perChannelSize = getSageVScaleSize(batchSize, numKVHeads, headDim);
+    int32_t const statBlocks = (perChannelSize + kSAGE_THREADS_PER_BLOCK - 1) / kSAGE_THREADS_PER_BLOCK;
+
+    computePerChannelStatsKernel<<<statBlocks, kSAGE_THREADS_PER_BLOCK, 0, stream>>>(
+        kvCache.dataPointer<half>(),
+        sequenceLengths.isEmpty() ? nullptr : sequenceLengths.dataPointer<int32_t>(),
+        vScale.dataPointer<float>(), kMean.dataPointer<float>(), batchSize, numKVHeads, headDim, capacity);
 }
 
 } // namespace sage

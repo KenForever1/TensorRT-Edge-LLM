@@ -1931,6 +1931,7 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelAcceptToken(SpecDecodeInference
 
 bool LLMInferenceSpecDecodeRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
 {
+
     bool draftProposalCaptureStatus{true};
     bool draftAcceptCaptureStatus{true};
     bool baseVerificationCaptureStatus{true};

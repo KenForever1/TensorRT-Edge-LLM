@@ -63,9 +63,10 @@ set_ifndef(CUDA_DIR /usr/local/cuda-${CUDA_CTK_VERSION})
 
 if(NOT DEFINED AARCH64_BUILD)
   set(CMAKE_CUDA_ARCHITECTURES 89)
-  if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
-    list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)
-  endif()
+  # Disabled SM100a/120 — fused attention kernel is SM89-specific
+  # if(CUDA_CTK_VERSION VERSION_GREATER_EQUAL 12.8)
+  #   list(APPEND CMAKE_CUDA_ARCHITECTURES 100a 120)
+  # endif()
 endif()
 
 # Orin/JetPack cuda.h may lack cudaLibrary_t; GDN runner uses compat typedef

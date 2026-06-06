@@ -19,6 +19,7 @@
 #include "sageAttentionHostUtils.h"
 
 #include "csrc/qattn/qk_int_sv_f8_cuda_sm89.cuh"
+#include "csrc/qattn/qk_int_sv_f8_cuda_sm89_fused.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -166,6 +167,54 @@ template void launchSageAttentionKernel<256, true, 3, true, half>(
     SageAttentionParams&, int32_t, int32_t, int32_t, size_t, cudaStream_t);
 template void launchSageAttentionKernel<256, false, 3, true, half>(
     SageAttentionParams&, int32_t, int32_t, int32_t, size_t, cudaStream_t);
+
+// Fused kernel launcher: loads K/V from FP16 KV cache, quantizes in-kernel.
+// Only for headDim=128, decode case.
+void launchSageAttentionFused(
+    int8_t* qPtr, half const* kvCache, half* oPtr,
+    float* qScale, float* vScalePerChannel, float* kMeanPerChannel,
+    int32_t const* sequenceLengths,
+    int32_t batchSize, int32_t numQoHeads, int32_t numKvHeads,
+    int32_t kvCacheCapacity,
+    int32_t strideBzQ, int32_t strideSeqQ, int32_t strideHQ,
+    int32_t strideBzO, int32_t strideSeqO, int32_t strideHO,
+    float smScale, cudaStream_t stream)
+{
+    constexpr int32_t HEAD_DIM = 128;
+    constexpr int32_t CTA_Q = 128;
+    constexpr int32_t CTA_K = 64;
+    constexpr int32_t WARP_Q = 32;
+    constexpr int32_t WARP_K = 64;
+    constexpr int32_t NUM_WARPS = (CTA_Q / WARP_Q) * (CTA_K / WARP_K); // 4
+
+    auto kernelFunc = sage_attn_fused_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, half, true>;
+
+    constexpr uint32_t Q_BYTES = CTA_Q * HEAD_DIM;
+    constexpr uint32_t K_BYTES = CTA_K * HEAD_DIM;
+    constexpr uint32_t V_BYTES = HEAD_DIM * CTA_K;
+    constexpr uint32_t TEMP_BYTES = CTA_K * HEAD_DIM * 2;
+    size_t smemSize = Q_BYTES + K_BYTES + V_BYTES + TEMP_BYTES;
+
+    cudaError_t attrErr = cudaFuncSetAttribute(kernelFunc,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize);
+    if (attrErr != cudaSuccess)
+    {
+        throw std::runtime_error(std::string("cudaFuncSetAttribute failed for fused SageAttention: ")
+            + cudaGetErrorString(attrErr));
+    }
+
+    dim3 grid(1, numQoHeads, batchSize);
+    dim3 block(32, NUM_WARPS);
+    uint32_t numKvGroups = static_cast<uint32_t>(numQoHeads / numKvHeads);
+
+    kernelFunc<<<grid, block, smemSize, stream>>>(
+        qPtr, kvCache, oPtr, qScale, vScalePerChannel, kMeanPerChannel, sequenceLengths,
+        static_cast<uint32_t>(1), static_cast<uint32_t>(kvCacheCapacity), numKvGroups,
+        static_cast<uint32_t>(kvCacheCapacity),
+        static_cast<uint32_t>(strideBzQ), static_cast<uint32_t>(strideSeqQ), static_cast<uint32_t>(strideHQ),
+        static_cast<uint32_t>(strideBzO), static_cast<uint32_t>(strideSeqO), static_cast<uint32_t>(strideHO),
+        smScale);
+}
 
 } // namespace sage
 } // namespace trt_edgellm

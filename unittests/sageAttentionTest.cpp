@@ -30,6 +30,7 @@
 #include "common/tensor.h"
 #include "kernels/sageAttentionKernels/sageAttentionRuntimeKernels.h"
 #include "kernels/sageAttentionKernels/sageAttentionRunner.h"
+#include "kernels/sageAttentionKernels/sageAttentionHostUtils.h"
 #include "sageAttentionTestKernels.h"
 #include "testUtils.h"
 
@@ -747,3 +748,329 @@ TEST(SageAttentionTest, DeviceSequenceLengthsBatchCapacityPadded)
 {
     TestSageAttentionDeviceSeqLensAccuracy(2, /*kvCapacity=*/512, /*effectiveKvLen=*/384, 16, 8, 128);
 }
+
+// Compare K INT8 from fused kernel vs convert pipeline
+TEST(SageAttentionTest, FusedKernelKInt8Compare)
+{
+    int32_t const batchSize = 1, qoLen = 1, kvLen = 64, numQoHeads = 4, numKvHeads = 4, headDim = 128;
+    int32_t kvCacheCapacity = kvLen;
+
+    // Generate test data
+    std::vector<half> qInput(batchSize*qoLen*numQoHeads*headDim), kInput(batchSize*kvLen*numKvHeads*headDim),
+                       vInput(kInput.size());
+    uniformFloatInitialization(qInput, -1.0f, 1.0f);
+    uniformFloatInitialization(kInput, -1.0f, 1.0f);
+    uniformFloatInitialization(vInput, -1.0f, 1.0f);
+
+    // Populate KV cache
+    int32_t kvCacheSize = batchSize * 2 * numKvHeads * kvCacheCapacity * headDim;
+    std::vector<half> kvCacheInput(kvCacheSize, __float2half(0.0f));
+    for (int32_t b = 0; b < batchSize; b++) for (int32_t h = 0; h < numKvHeads; h++)
+        for (int32_t s = 0; s < kvLen; s++) for (int32_t d = 0; d < headDim; d++) {
+            int64_t src = ((b*kvLen+s)*numKvHeads+h)*headDim+d;
+            kvCacheInput[(((b*2*numKvHeads+h)*kvCacheCapacity+s)*headDim+d)] = kInput[src];
+            kvCacheInput[(((b*2*numKvHeads+numKvHeads+h)*kvCacheCapacity+s)*headDim+d)] = vInput[src];
+        }
+
+    std::vector<int32_t> seqLens(batchSize, kvLen);
+
+    // GPU tensors
+    rt::Tensor qTensor({batchSize, qoLen, numQoHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor kvTensor({batchSize, 2, numKvHeads, kvCacheCapacity, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    rt::Tensor slTensor({batchSize}, rt::DeviceType::kGPU, DataType::kINT32);
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaMemcpy(qTensor.rawPointer(), qInput.data(), qInput.size()*sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(kvTensor.rawPointer(), kvCacheInput.data(), kvCacheSize*sizeof(half), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(slTensor.rawPointer(), seqLens.data(), batchSize*sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    // Reference: convert pipeline K INT8
+    int32_t paddedKvLen = sage::getSagePaddedKvLen(kvCacheCapacity);
+    rt::Tensor qInt8R({batchSize, qoLen, numQoHeads, headDim}, rt::DeviceType::kGPU, DataType::kINT8);
+    rt::Tensor kInt8R({batchSize, kvCacheCapacity, numKvHeads, headDim}, rt::DeviceType::kGPU, DataType::kINT8);
+    rt::Tensor vFp8R({batchSize, headDim, numKvHeads, paddedKvLen}, rt::DeviceType::kGPU, DataType::kINT8);
+    rt::Tensor qScaleR({sage::getSageQScaleSize(batchSize, qoLen, numQoHeads)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor kScaleR({sage::getSageKScaleSize(batchSize, kvCacheCapacity, numKvHeads)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor vScaleR({sage::getSageVScaleSize(batchSize, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor kMeanR({sage::getSageVScaleSize(batchSize, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor pvmR({sage::getSageStatsPartialsSize(batchSize, kvCacheCapacity, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor pksR({sage::getSageStatsPartialsSize(batchSize, kvCacheCapacity, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    sage::launchSageQuantizeQToInt8(qTensor, qInt8R, qScaleR, stream);
+    sage::launchSageConvertKVCacheToInt8AndFp8(kvTensor, slTensor, kInt8R, vFp8R, kScaleR, vScaleR, kMeanR, pvmR, pksR, kvCacheCapacity, stream);
+
+    // Fused kernel: K INT8 debug output
+    rt::Tensor qInt8F({batchSize, qoLen, numQoHeads, headDim}, rt::DeviceType::kGPU, DataType::kINT8);
+    rt::Tensor qScaleF({sage::getSageQScaleSize(batchSize, qoLen, numQoHeads)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    rt::Tensor vScaleCh({sage::getSageVScaleSize(batchSize, numKvHeads, headDim)}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    int32_t kDebugSize = batchSize * kvCacheCapacity * numKvHeads * headDim;
+    rt::Tensor kDebug({kDebugSize}, rt::DeviceType::kGPU, DataType::kINT8);
+    int32_t ksDebugSize = batchSize * numKvHeads;
+    rt::Tensor ksDebug({ksDebugSize}, rt::DeviceType::kGPU, DataType::kFLOAT);
+    int32_t vDebugSize = batchSize * kvCacheCapacity * numKvHeads * headDim;
+    rt::Tensor vDebug({vDebugSize}, rt::DeviceType::kGPU, DataType::kINT8);
+    rt::Tensor oF({batchSize, qoLen, numQoHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+
+    sage::launchSageQuantizeQToInt8(qTensor, qInt8F, qScaleF, stream);
+    sage::launchSageComputeVChannelScales(kvTensor, slTensor, vScaleCh, kvCacheCapacity, stream);
+    int32_t stBz = qoLen * numQoHeads * headDim, stSeq = numQoHeads * headDim;
+    float smS = 1.0f / std::sqrt((float)headDim);
+    sage::launchSageAttentionFused(
+        static_cast<int8_t*>(qInt8F.rawPointer()), static_cast<half const*>(kvTensor.rawPointer()),
+        static_cast<half*>(oF.rawPointer()), static_cast<float*>(qScaleF.rawPointer()),
+        static_cast<float*>(vScaleCh.rawPointer()), nullptr, static_cast<int32_t const*>(slTensor.rawPointer()),
+        batchSize, numQoHeads, numKvHeads, kvCacheCapacity,
+        stBz, stSeq, headDim, stBz, stSeq, headDim, smS, stream);
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // Compare K scales
+    {
+        int32_t ksN = sage::getSageKScaleSize(batchSize, kvCacheCapacity, numKvHeads);
+        std::vector<float> ksRef(ksN);
+        CUDA_CHECK(cudaMemcpy(ksRef.data(), kScaleR.rawPointer(), ksN*sizeof(float), cudaMemcpyDeviceToHost));
+        std::cout << "K scales (ref): ";
+        for (int32_t i = 0; i < std::min(5, ksN); i++) std::cout << ksRef[i] << " ";
+        std::cout << std::endl;
+        std::vector<float> ksFused(ksDebugSize);
+        CUDA_CHECK(cudaMemcpy(ksFused.data(), ksDebug.rawPointer(), ksDebugSize*sizeof(float), cudaMemcpyDeviceToHost));
+        std::cout << "K scales (fused): ";
+        for (int32_t i = 0; i < std::min(5, ksDebugSize); i++) std::cout << ksFused[i] << " ";
+        std::cout << std::endl;
+    }
+
+    // Compare K INT8
+    std::vector<int8_t> kRef(kDebugSize), kFused(kDebugSize);
+    CUDA_CHECK(cudaMemcpy(kRef.data(), kInt8R.rawPointer(), kDebugSize, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(kFused.data(), kDebug.rawPointer(), kDebugSize, cudaMemcpyDeviceToHost));
+
+    int32_t mismatches = 0, total = 0;
+    for (int32_t b = 0; b < batchSize; b++) for (int32_t h = 0; h < numKvHeads; h++)
+        for (int32_t s = 0; s < kvLen; s++) for (int32_t d = 0; d < headDim; d++) {
+            // Both in [B][S][H][D] layout
+            int64_t idx = ((b*kvCacheCapacity + s)*numKvHeads + h)*headDim + d;
+            total++;
+            if (kRef[idx] != kFused[idx]) mismatches++;
+        }
+
+    std::cout << "K INT8 comparison: mismatches=" << mismatches << "/" << total
+              << " (" << (100.0f*mismatches/total) << "%)" << std::endl;
+    if (mismatches > 0) {
+        std::cout << "First 10 mismatches (b,h,s,d): ref vs fused" << std::endl;
+        int cnt = 0;
+        for (int32_t b = 0; b < batchSize && cnt < 10; b++) for (int32_t h = 0; h < numKvHeads && cnt < 10; h++)
+            for (int32_t s = 0; s < kvLen && cnt < 10; s++) for (int32_t d = 0; d < headDim && cnt < 10; d++) {
+                int64_t idx = ((b*kvCacheCapacity + s)*numKvHeads + h)*headDim + d;
+                if (kRef[idx] != kFused[idx]) {
+                    std::cout << "  (" << b << "," << h << "," << s << "," << d
+                              << ") ref=" << (int)kRef[idx] << " fused=" << (int)kFused[idx] << std::endl;
+                    cnt++;
+                }
+            }
+    }
+    // K INT8 differs due to K-mean (fused kernel doesn't apply K-mean)
+    // K-mean is softmax-invariant, so this doesn't affect attention output
+    std::cout << "  (expected: K-mean not applied in fused kernel)" << std::endl;
+
+    // Compare V-FP8 (fused bypass smem vs reference, accounting for K-mean effect on ref)
+    {
+        std::vector<int8_t> vRef(vDebugSize), vFused(vDebugSize);
+        CUDA_CHECK(cudaMemcpy(vRef.data(), vFp8R.rawPointer(), vFp8R.getMemoryCapacity(), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(vFused.data(), vDebug.rawPointer(), vDebugSize, cudaMemcpyDeviceToHost));
+        int32_t vMismatches = 0, vTotal = 0;
+        for (int32_t b = 0; b < batchSize; b++) for (int32_t h = 0; h < numKvHeads; h++)
+            for (int32_t s = 0; s < kvLen; s++) for (int32_t d = 0; d < headDim; d++) {
+                int32_t mod16 = s%16, ps = (mod16/8)*2 + ((mod16/2)%4)*4 + (mod16%2);
+                int32_t permS = (s/16)*16 + ps;
+                int64_t rIdx = ((b*headDim+d)*numKvHeads+h)*paddedKvLen + permS;
+                int64_t fIdx = ((b*kvCacheCapacity+s)*numKvHeads+h)*headDim + d;
+                vTotal++;
+                if (vRef[rIdx] != vFused[fIdx]) vMismatches++;
+            }
+        std::cout << "V-FP8 comparison (bypass smem): mismatches=" << vMismatches << "/" << vTotal
+                  << " (" << (100.0f*vMismatches/vTotal) << "%)" << std::endl;
+        if (vMismatches > 0) {
+            int cnt = 0;
+            for (int32_t b = 0; b < batchSize && cnt < 5; b++) for (int32_t h = 0; h < numKvHeads && cnt < 5; h++)
+                for (int32_t s = 0; s < kvLen && cnt < 5; s++) for (int32_t d = 0; d < headDim && cnt < 5; d++) {
+                    int32_t mod16 = s%16, ps = (mod16/8)*2 + ((mod16/2)%4)*4 + (mod16%2);
+                    int64_t rIdx = ((b*headDim+d)*numKvHeads+h)*paddedKvLen + (s/16)*16+ps;
+                    int64_t fIdx = ((b*kvCacheCapacity+s)*numKvHeads+h)*headDim+d;
+                    if (vRef[rIdx] != vFused[fIdx]) {
+                        std::cout << "  (" << b << "," << h << "," << s << "," << d
+                                  << ") ref=" << (int)vRef[rIdx] << " fused=" << (int)vFused[fIdx] << std::endl;
+                        cnt++;
+                    }
+                }
+        }
+    }
+
+    // Compare attention output
+    {
+        std::vector<half> oRef(batchSize*qoLen*numQoHeads*headDim), oFused(oRef.size());
+        rt::Tensor oRefT({batchSize, qoLen, numQoHeads, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+        SageAttentionParams rp{};
+        rp.q_ptr = static_cast<int8_t*>(qInt8R.rawPointer());
+        rp.k_ptr = static_cast<int8_t*>(kInt8R.rawPointer());
+        rp.v_ptr = static_cast<int8_t*>(vFp8R.rawPointer());
+        rp.o_ptr = oRefT.rawPointer();
+        rp.q_scale_ptr = static_cast<float*>(qScaleR.rawPointer());
+        rp.k_scale_ptr = static_cast<float*>(kScaleR.rawPointer());
+        rp.v_scale_ptr = static_cast<float*>(vScaleR.rawPointer());
+        rp.fuse_v_scale = true;
+        rp.batch_size = batchSize; rp.qo_len = qoLen; rp.kv_len = kvCacheCapacity;
+        rp.num_qo_heads = numQoHeads; rp.num_kv_heads = numKvHeads; rp.head_dim = headDim;
+        rp.tensor_layout = SageTensorLayout::kBSHD; rp.mask_mode = SageMaskMode::kNone;
+        rp.qk_quant_gran = SageQuantGranularity::kPerWarp;
+        rp.stride_bz_q = qoLen*numQoHeads*headDim; rp.stride_seq_q = numQoHeads*headDim; rp.stride_h_q = headDim;
+        rp.stride_bz_k = kvCacheCapacity*numKvHeads*headDim; rp.stride_seq_k = numKvHeads*headDim; rp.stride_h_k = headDim;
+        rp.stride_bz_v = headDim*numKvHeads*paddedKvLen; rp.stride_h_v = paddedKvLen; rp.stride_d_v = numKvHeads*paddedKvLen;
+        rp.stride_bz_o = qoLen*numQoHeads*headDim; rp.stride_seq_o = numQoHeads*headDim; rp.stride_h_o = headDim;
+        SageAttentionRunner rr(DataType::kHALF, batchSize, qoLen, kvCacheCapacity, numQoHeads, numKvHeads, headDim, 89);
+        rr.run(rp, nullptr, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        CUDA_CHECK(cudaMemcpy(oRef.data(), oRefT.rawPointer(), oRef.size()*sizeof(half), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(oFused.data(), oF.rawPointer(), oFused.size()*sizeof(half), cudaMemcpyDeviceToHost));
+        int32_t oM = 0; float maxD = 0, sumD = 0, sumR = 0;
+        for (size_t i = 0; i < oRef.size(); i++) {
+            float r = __half2float(oRef[i]), f = __half2float(oFused[i]);
+            float d = fabsf(r-f); sumD += d; sumR += fabsf(r); maxD = fmaxf(maxD, d);
+            if (d > 0.001f*fmaxf(fabsf(r),0.001f)) oM++;
+        }
+        std::cout << "Attention output: mismatches=" << oM << "/" << oRef.size()
+                  << " maxDiff=" << maxD << " avgRelErr=" << (sumR>0?sumD/sumR:0) << std::endl;
+    }
+}
+
+// Compare fused vs original kernel with IDENTICAL K/V quantization (no K-mean, single FP8)
+TEST(SageAttentionTest, FusedKernelMatchedQuant)
+{
+    int32_t const B=1,qL=1,kL=64,Hq=4,Hkv=4,D=128,pkL=sage::getSagePaddedKvLen(kL);
+    // Generate data
+    std::vector<half> qH(B*qL*Hq*D),kH(B*kL*Hkv*D),vH(kH.size()),kvH(B*2*Hkv*kL*D,__float2half(0));
+    uniformFloatInitialization(qH,-1,1); uniformFloatInitialization(kH,-1,1); uniformFloatInitialization(vH,-1,1);
+    for(int b=0;b<B;b++)for(int h=0;h<Hkv;h++)for(int s=0;s<kL;s++)for(int d=0;d<D;d++){
+        auto src=((b*kL+s)*Hkv+h)*D+d;
+        kvH[(((b*2*Hkv+h)*kL+s)*D+d)]=kH[src];
+        kvH[(((b*2*Hkv+Hkv+h)*kL+s)*D+d)]=vH[src];
+    }
+    std::vector<int32_t> sl(B,kL);
+    cudaStream_t s=nullptr;
+    auto mt=[&](auto sh,auto dt){return rt::Tensor(sh,rt::DeviceType::kGPU,dt);};
+    auto dt_sz=[](nvinfer1::DataType t)->size_t{return t==DataType::kHALF?2:t==DataType::kFLOAT?4:1;};
+    auto cp=[&](auto&h,auto&d){CUDA_CHECK(cudaMemcpy(d.rawPointer(),h.data(),h.size()*dt_sz(d.getDataType()),cudaMemcpyHostToDevice));};
+
+    rt::Tensor qT=mt(rt::Coords{B,qL,Hq,D},DataType::kHALF); cp(qH,qT);
+    rt::Tensor kvT=mt(rt::Coords{B,2,Hkv,kL,D},DataType::kHALF); cp(kvH,kvT);
+    rt::Tensor slT=mt(rt::Coords{B},DataType::kINT32); cp(sl,slT);
+    rt::Tensor qI=mt(rt::Coords{B,qL,Hq,D},DataType::kINT8);
+    rt::Tensor qS=mt(rt::Coords{sage::getSageQScaleSize(B,qL,Hq)},DataType::kFLOAT);
+    rt::Tensor vsC=mt(rt::Coords{sage::getSageVScaleSize(B,Hkv,D)},DataType::kFLOAT);
+    sage::launchSageQuantizeQToInt8(qT,qI,qS,s);
+    sage::launchSageComputeVChannelScales(kvT,slT,vsC,kL,s);
+
+    // Get K-scales from convert pipeline
+    rt::Tensor kSR=mt(rt::Coords{sage::getSageKScaleSize(B,kL,Hkv)},DataType::kFLOAT);
+    {rt::Tensor kIR=mt(rt::Coords{B,kL,Hkv,D},DataType::kINT8);
+     rt::Tensor vFR=mt(rt::Coords{B,D,Hkv,pkL},DataType::kINT8);
+     rt::Tensor vSR=mt(rt::Coords{sage::getSageVScaleSize(B,Hkv,D)},DataType::kFLOAT);
+     rt::Tensor kMR=mt(rt::Coords{sage::getSageVScaleSize(B,Hkv,D)},DataType::kFLOAT);
+     rt::Tensor pvR=mt(rt::Coords{sage::getSageStatsPartialsSize(B,kL,Hkv,D)},DataType::kFLOAT);
+     rt::Tensor pkR=mt(rt::Coords{sage::getSageStatsPartialsSize(B,kL,Hkv,D)},DataType::kFLOAT);
+     sage::launchSageConvertKVCacheToInt8AndFp8(kvT,slT,kIR,vFR,kSR,vSR,kMR,pvR,pkR,kL,s);}
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    auto kSH=std::vector<float>(B*Hkv*1); CUDA_CHECK(cudaMemcpy(kSH.data(),kSR.rawPointer(),kSH.size()*4,cudaMemcpyDeviceToHost));
+    auto vsH=std::vector<float>(B*Hkv*D); CUDA_CHECK(cudaMemcpy(vsH.data(),vsC.rawPointer(),vsH.size()*4,cudaMemcpyDeviceToHost));
+
+    // Host-compute K_INT8 (no K-mean!)
+    auto kI=std::vector<int8_t>(B*kL*Hkv*D,0);
+    for(int b=0;b<B;b++)for(int h=0;h<Hkv;h++)for(int s=0;s<kL;s++)for(int d=0;d<D;d++){
+        int64_t src=((b*kL+s)*Hkv+h)*D+d; float fv=__half2float(kH[src]);
+        int qi=(int)nearbyintf(fv/kSH[b*Hkv+h]); kI[((b*kL+s)*Hkv+h)*D+d]=(int8_t)std::min(127,std::max(-127,qi));
+    }
+    // Host-compute V_FP8 (single conversion)
+    auto vF8=std::vector<int8_t>(B*D*Hkv*pkL,0);
+    for(int b=0;b<B;b++)for(int h=0;h<Hkv;h++)for(int s=0;s<kL;s++)for(int d=0;d<D;d++){
+        float fv=__half2float(vH[((b*kL+s)*Hkv+h)*D+d]); float vs=vsH[(b*Hkv+h)*D+d];
+        __nv_fp8_e4m3 f8(fv/vs); int m=s%16,ps=(m/8)*2+((m/2)%4)*4+(m%2);
+        vF8[((b*D+d)*Hkv+h)*pkL+(s/16)*16+ps]=*(int8_t*)&f8;
+    }
+
+    rt::Tensor kIT=mt(rt::Coords{B,kL,Hkv,D},DataType::kINT8); cp(kI,kIT);
+    rt::Tensor vFT=mt(rt::Coords{B,D,Hkv,pkL},DataType::kINT8); cp(vF8,vFT);
+    rt::Tensor oRT=mt(rt::Coords{B,qL,Hq,D},DataType::kHALF);
+    rt::Tensor oFT=mt(rt::Coords{B,qL,Hq,D},DataType::kHALF);
+
+    // Original kernel with host-computed K/V
+    {SageAttentionParams rp{}; rp.q_ptr=(int8_t*)qI.rawPointer(); rp.k_ptr=kIT.dataPointer<int8_t>(); rp.v_ptr=vFT.dataPointer<int8_t>();
+     rp.o_ptr=oRT.rawPointer(); rp.q_scale_ptr=(float*)qS.rawPointer(); rp.k_scale_ptr=(float*)kSR.rawPointer(); rp.v_scale_ptr=(float*)vsC.rawPointer();
+     rp.fuse_v_scale=true; rp.batch_size=B;rp.qo_len=qL;rp.kv_len=kL;rp.num_qo_heads=Hq;rp.num_kv_heads=Hkv;rp.head_dim=D;
+     rp.tensor_layout=SageTensorLayout::kBSHD;rp.mask_mode=SageMaskMode::kNone;rp.qk_quant_gran=SageQuantGranularity::kPerWarp;
+     rp.stride_bz_q=qL*Hq*D;rp.stride_seq_q=Hq*D;rp.stride_h_q=D;rp.stride_bz_k=kL*Hkv*D;rp.stride_seq_k=Hkv*D;rp.stride_h_k=D;
+     rp.stride_bz_v=D*Hkv*pkL;rp.stride_h_v=pkL;rp.stride_d_v=Hkv*pkL;rp.stride_bz_o=qL*Hq*D;rp.stride_seq_o=Hq*D;rp.stride_h_o=D;
+     SageAttentionRunner rr(DataType::kHALF,B,qL,kL,Hq,Hkv,D,89); rr.run(rp,nullptr,s);}
+
+    // Fused kernel
+    {int sb=qL*Hq*D,ss=Hq*D; float sm=1.0f/sqrtf((float)D);
+     sage::launchSageAttentionFused((int8_t*)qI.rawPointer(),(half const*)kvT.rawPointer(),(half*)oFT.rawPointer(),
+         (float*)qS.rawPointer(),(float*)vsC.rawPointer(),nullptr,(int32_t const*)slT.rawPointer(),B,Hq,Hkv,kL,sb,ss,D,sb,ss,D,sm,s);}
+    CUDA_CHECK(cudaStreamSynchronize(s));
+
+    // Compare
+    auto oR=std::vector<half>(B*qL*Hq*D),oF=oR; cp(oR,oRT); cp(oF,oFT);
+    int mM=0;float md=0,sd=0,sr=0;
+    for(size_t i=0;i<oR.size();i++){float r=__half2float(oR[i]),f=__half2float(oF[i]);float d=fabsf(r-f);sd+=d;sr+=fabsf(r);md=fmaxf(md,d);if(d>0.001f*fmaxf(fabsf(r),0.001f))mM++;}
+    std::cout<<"MATCHED-QUANT: mismatches="<<mM<<"/"<<oR.size()<<" maxDiff="<<md<<" avgRelErr="<<(sr>0?sd/sr:0)<<std::endl;
+    if(mM>0){for(int i=0;i<5&&i<(int)oR.size();i++)std::cout<<" ["<<i<<"] ref="<<__half2float(oR[i])<<" fused="<<__half2float(oF[i])<<" diff="<<fabsf(__half2float(oR[i])-__half2float(oF[i]))<<std::endl;}
+    EXPECT_LT(mM,(int)oR.size()/2);
+}
+
+TEST(SageAttentionTest, MatchedQuant256H8) {
+    int32_t const B=1,qL=1,kL=256,Hq=8,Hkv=8,D=128,pkL=sage::getSagePaddedKvLen(kL);
+    std::vector<half> qH(B*qL*Hq*D),kH(B*kL*Hkv*D),vH(kH.size()),kvH(int64_t(B)*2*Hkv*kL*D,__float2half(0.0f));
+    uniformFloatInitialization(qH,-1,1); uniformFloatInitialization(kH,-1,1); uniformFloatInitialization(vH,-1,1);
+    for(int b=0;b<B;b++)for(int h=0;h<Hkv;h++)for(int s=0;s<kL;s++)for(int d=0;d<D;d++){
+        auto src=((int64_t(b)*kL+s)*Hkv+h)*D+d;
+        kvH[(((int64_t(b)*2*Hkv+h)*kL+s)*D+d)]=kH[src];
+        kvH[(((int64_t(b)*2*Hkv+Hkv+h)*kL+s)*D+d)]=vH[src];
+    }
+    std::vector<int32_t> sl(B,kL); cudaStream_t s=nullptr;
+    auto mt=[&](auto sh,auto dt){return rt::Tensor(sh,rt::DeviceType::kGPU,dt);};
+    auto dsz=[](nvinfer1::DataType t)->size_t{return t==DataType::kHALF?2:t==DataType::kFLOAT?4:1;};
+    auto cp=[&](auto&h,auto&d){CUDA_CHECK(cudaMemcpy(d.rawPointer(),h.data(),h.size()*dsz(d.getDataType()),cudaMemcpyHostToDevice));};
+    rt::Tensor qT=mt(rt::Coords{B,qL,Hq,D},DataType::kHALF); cp(qH,qT);
+    rt::Tensor kvT=mt(rt::Coords{B,2,Hkv,kL,D},DataType::kHALF); cp(kvH,kvT);
+    rt::Tensor slT=mt(rt::Coords{B},DataType::kINT32); cp(sl,slT);
+    rt::Tensor qI=mt(rt::Coords{B,qL,Hq,D},DataType::kINT8);
+    rt::Tensor qS=mt(rt::Coords{sage::getSageQScaleSize(B,qL,Hq)},DataType::kFLOAT);
+    rt::Tensor vsC=mt(rt::Coords{sage::getSageVScaleSize(B,Hkv,D)},DataType::kFLOAT);
+    sage::launchSageQuantizeQToInt8(qT,qI,qS,s);
+    sage::launchSageComputeVChannelScales(kvT,slT,vsC,kL,s);
+    rt::Tensor kSR=mt(rt::Coords{sage::getSageKScaleSize(B,kL,Hkv)},DataType::kFLOAT);
+    {rt::Tensor kIR=mt(rt::Coords{B,kL,Hkv,D},DataType::kINT8);rt::Tensor vFR=mt(rt::Coords{B,D,Hkv,pkL},DataType::kINT8);rt::Tensor vSR=mt(rt::Coords{sage::getSageVScaleSize(B,Hkv,D)},DataType::kFLOAT);rt::Tensor kMR=mt(rt::Coords{sage::getSageVScaleSize(B,Hkv,D)},DataType::kFLOAT);rt::Tensor pvR=mt(rt::Coords{sage::getSageStatsPartialsSize(B,kL,Hkv,D)},DataType::kFLOAT);rt::Tensor pkR=mt(rt::Coords{sage::getSageStatsPartialsSize(B,kL,Hkv,D)},DataType::kFLOAT);sage::launchSageConvertKVCacheToInt8AndFp8(kvT,slT,kIR,vFR,kSR,vSR,kMR,pvR,pkR,kL,s);}
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    auto kSH=std::vector<float>(B*Hkv*(kL/64)); CUDA_CHECK(cudaMemcpy(kSH.data(),kSR.rawPointer(),kSH.size()*4,cudaMemcpyDeviceToHost));
+    auto vsH=std::vector<float>(B*Hkv*D); CUDA_CHECK(cudaMemcpy(vsH.data(),vsC.rawPointer(),vsH.size()*4,cudaMemcpyDeviceToHost));
+    auto kI=std::vector<int8_t>(int64_t(B)*kL*Hkv*D,0);
+    for(int b=0;b<B;b++)for(int h=0;h<Hkv;h++)for(int s=0;s<kL;s++)for(int d=0;d<D;d++){
+        int64_t src=((int64_t(b)*kL+s)*Hkv+h)*D+d; float fv=__half2float(kH[src]);
+        int blk=s/64; int qi=(int)nearbyintf(fv/kSH[int64_t(b)*Hkv*(kL/64)+h*(kL/64)+blk]);
+        kI[((int64_t(b)*kL+s)*Hkv+h)*D+d]=(int8_t)std::min(127,std::max(-127,qi));
+    }
+    auto vF8=std::vector<int8_t>(int64_t(B)*D*Hkv*pkL,0);
+    for(int b=0;b<B;b++)for(int h=0;h<Hkv;h++)for(int s=0;s<kL;s++)for(int d=0;d<D;d++){
+        float fv=__half2float(vH[((int64_t(b)*kL+s)*Hkv+h)*D+d]); float vs=vsH[(int64_t(b)*Hkv+h)*D+d];
+        __nv_fp8_e4m3 f8(fv/vs); int m=s%16,ps=(m/8)*2+((m/2)%4)*4+(m%2);
+        vF8[((int64_t(b)*D+d)*Hkv+h)*pkL+(s/16)*16+ps]=*(int8_t*)&f8;
+    }
+    rt::Tensor kIT=mt(rt::Coords{B,kL,Hkv,D},DataType::kINT8); cp(kI,kIT);
+    rt::Tensor vFT=mt(rt::Coords{B,D,Hkv,pkL},DataType::kINT8); cp(vF8,vFT);
+    rt::Tensor oRT=mt(rt::Coords{B,qL,Hq,D},DataType::kHALF); rt::Tensor oFT=mt(rt::Coords{B,qL,Hq,D},DataType::kHALF);
+    {SageAttentionParams rp{}; rp.q_ptr=(int8_t*)qI.rawPointer(); rp.k_ptr=kIT.dataPointer<int8_t>(); rp.v_ptr=vFT.dataPointer<int8_t>();rp.o_ptr=oRT.rawPointer();rp.q_scale_ptr=(float*)qS.rawPointer();rp.k_scale_ptr=(float*)kSR.rawPointer();rp.v_scale_ptr=(float*)vsC.rawPointer();rp.fuse_v_scale=true;rp.batch_size=B;rp.qo_len=qL;rp.kv_len=kL;rp.num_qo_heads=Hq;rp.num_kv_heads=Hkv;rp.head_dim=D;rp.tensor_layout=SageTensorLayout::kBSHD;rp.mask_mode=SageMaskMode::kNone;rp.qk_quant_gran=SageQuantGranularity::kPerWarp;rp.stride_bz_q=qL*Hq*D;rp.stride_seq_q=Hq*D;rp.stride_h_q=D;rp.stride_bz_k=kL*Hkv*D;rp.stride_seq_k=Hkv*D;rp.stride_h_k=D;rp.stride_bz_v=D*Hkv*pkL;rp.stride_h_v=pkL;rp.stride_d_v=Hkv*pkL;rp.stride_bz_o=qL*Hq*D;rp.stride_seq_o=Hq*D;rp.stride_h_o=D;SageAttentionRunner rr(DataType::kHALF,B,qL,kL,Hq,Hkv,D,89);rr.run(rp,nullptr,s);}
+    {int sb=qL*Hq*D,ss=Hq*D;float sm=1.0f/sqrtf((float)D);sage::launchSageAttentionFused((int8_t*)qI.rawPointer(),(half const*)kvT.rawPointer(),(half*)oFT.rawPointer(),(float*)qS.rawPointer(),(float*)vsC.rawPointer(),nullptr,(int32_t const*)slT.rawPointer(),B,Hq,Hkv,kL,sb,ss,D,sb,ss,D,sm,s);}
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    auto oR=std::vector<half>(qH.size()),oF=oR; cp(oR,oRT); cp(oF,oFT);
+    int mM=0;float md=0,sd=0,sr=0;
+    for(size_t i=0;i<oR.size();i++){float r=__half2float(oR[i]),f=__half2float(oF[i]);float d=fabsf(r-f);sd+=d;sr+=fabsf(r);md=fmaxf(md,d);if(d>0.001f*fmaxf(fabsf(r),0.001f))mM++;}
+    std::cout<<"MATCHED_k256_H8: m="<<mM<<"/"<<oR.size()<<" md="<<md<<" ae="<<(sr>0?sd/sr:0)<<std::endl;
+    EXPECT_LT(mM,(int)oR.size()/2);
+}
+

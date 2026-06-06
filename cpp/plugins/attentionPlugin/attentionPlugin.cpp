@@ -27,6 +27,7 @@
 #include "kernels/kvCacheUtilKernels/kvCacheUtilsKernels.h"
 #include "kernels/sageAttentionKernels/sageAttentionRuntimeKernels.h"
 #include "kernels/sageAttentionKernels/sageAttentionRunner.h"
+#include "kernels/sageAttentionKernels/sageAttentionHostUtils.h"
 #include "plugins/utils/pluginUtils.h"
 
 // CuTe DSL FMHA kernel (Blackwell SM100+)
@@ -890,6 +891,35 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
             // and the SageAttention kernel (padding-mask via seq_lens) consume.
             bool const useSageDecode = canUseSageDecode(executionMode, runtimeSeqLen, mSMVersion, mDataType, mHeadSize,
                 mNumQHeads, mNumKVHeads, mSlidingWindowSize, mEnableTreeAttention, mEnableFp8KVCache);
+            // Fused kernel (loads K/V from cache, Plan 1)
+            bool const useFusedKernel = true;
+
+            if (useFusedKernel && useSageDecode && kvCacheCapacity > 0 && mHeadSize == 128)
+            {
+                int32_t const qoLen = runtimeSeqLen;
+                rt::Tensor qInt8Tensor = assignTensorFromWorkspace(
+                    alignedWorkspacePtr, {runtimeBatchSize, qoLen, mNumQHeads, mHeadSize}, DataType::kINT8);
+                rt::Tensor qScaleTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                    {sage::getSageQScaleSize(runtimeBatchSize, qoLen, mNumQHeads)}, DataType::kFLOAT);
+                rt::Tensor vScaleChTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                    {sage::getSageVScaleSize(runtimeBatchSize, mNumKVHeads, mHeadSize)}, DataType::kFLOAT);
+                rt::Tensor kMeanTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
+                    {sage::getSageVScaleSize(runtimeBatchSize, mNumKVHeads, mHeadSize)}, DataType::kFLOAT);
+                sage::launchSageQuantizeQToInt8(qInputTensor, qInt8Tensor, qScaleTensor, stream);
+                sage::launchSageComputeVScalesAndKMeans(kvCacheTensor, contextLengthTensor, vScaleChTensor, kMeanTensor, kvCacheCapacity, stream);
+                int32_t strideBzQ = qoLen * mNumQHeads * mHeadSize;
+                int32_t strideSeqQ = mNumQHeads * mHeadSize;
+                float smScale = 1.0f / std::sqrt(static_cast<float>(mHeadSize));
+                sage::launchSageAttentionFused(
+                    qInt8Tensor.dataPointer<int8_t>(), static_cast<half const*>(kvCacheTensor.rawPointer()),
+                    attentionOutputTensor.dataPointer<half>(), qScaleTensor.dataPointer<float>(),
+                    vScaleChTensor.dataPointer<float>(), kMeanTensor.dataPointer<float>(),
+                    contextLengthTensor.dataPointer<int32_t>(),
+                    runtimeBatchSize, mNumQHeads, mNumKVHeads, kvCacheCapacity,
+                    strideBzQ, strideSeqQ, mHeadSize, strideBzQ, strideSeqQ, mHeadSize, smScale, stream);
+
+                return 0;
+            }
             if (useSageDecode && kvCacheCapacity > 0)
             {
                 int32_t const qoLen = runtimeSeqLen;
@@ -1146,4 +1176,4 @@ nvinfer1::IPluginV2* AttentionPluginCreator::deserializePlugin(
 }
 
 } // namespace plugins
-} // namespace trt_edgellm
+} // name

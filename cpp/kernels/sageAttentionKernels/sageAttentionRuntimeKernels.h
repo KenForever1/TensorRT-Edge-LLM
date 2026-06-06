@@ -58,5 +58,15 @@ void launchSageConvertKVCacheToInt8AndFp8(rt::Tensor const& kvCache, rt::Tensor 
     rt::Tensor& kInt8, rt::Tensor& vFp8, rt::Tensor& kScale, rt::Tensor& vScale, rt::Tensor& kMean,
     rt::Tensor& partialVMax, rt::Tensor& partialKSum, int32_t kvLen, cudaStream_t stream);
 
+// Compute V per-channel scales from KV cache for fused attention path.
+// vScale: [batchSize, numKVHeads, headDim] — tiny, independent of kvLen.
+void launchSageComputeVChannelScales(rt::Tensor const& kvCache, rt::Tensor const& sequenceLengths,
+    rt::Tensor& vScale, int32_t kvLen, cudaStream_t stream);
+
+// Compute per-channel V scales and K means from KV cache.
+// vScale: [batchSize, numKVHeads, headDim], kMean: same size.
+void launchSageComputeVScalesAndKMeans(rt::Tensor const& kvCache, rt::Tensor const& sequenceLengths,
+    rt::Tensor& vScale, rt::Tensor& kMean, int32_t kvLen, cudaStream_t stream);
+
 } // namespace sage
 } // namespace trt_edgellm

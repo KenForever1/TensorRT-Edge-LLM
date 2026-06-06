@@ -167,5 +167,16 @@ void launchSageAttentionKernel(
     size_t smemSize,
     cudaStream_t stream);
 
+// Fused kernel launcher (decode-only, headDim=128): loads K/V from FP16 KV cache directly.
+void launchSageAttentionFused(
+    int8_t* qPtr, half const* kvCache, half* oPtr,
+    float* qScale, float* vScalePerChannel, float* kMeanPerChannel,
+    int32_t const* sequenceLengths,
+    int32_t batchSize, int32_t numQoHeads, int32_t numKvHeads,
+    int32_t kvCacheCapacity,
+    int32_t strideBzQ, int32_t strideSeqQ, int32_t strideHQ,
+    int32_t strideBzO, int32_t strideSeqO, int32_t strideHO,
+    float smScale, cudaStream_t stream);
+
 } // namespace sage
 } // namespace trt_edgellm
