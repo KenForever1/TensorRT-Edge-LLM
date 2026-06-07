@@ -31,6 +31,12 @@ void launchSageReferenceAttention(half const* q, half const* k, half const* v, h
 void launchQuantizeToInt8PerWarp(half const* input, int8_t* output, float* scales, int32_t batchSize, int32_t seqLen,
     int32_t numHeads, int32_t headDim, bool isQuery, cudaStream_t stream);
 
+//! FP8 roundtrip verification: encode→decode for values near 448
+void launchFp8RoundtripTest(float* output, cudaStream_t stream);
+
+//! FP8 smem→TensorCore roundtrip: store FP8 in swizzled smem, read via compute_fp8_sv
+void launchFp8SmemRoundtripTest(float* output, cudaStream_t stream);
+
 //! Launches FP8 quantization for BSHD value tensors and stores output in SageAttention transposed layout.
 void launchQuantizeToFp8Transposed(half const* input, int8_t* output, int32_t batchSize, int32_t seqLen,
     int32_t numHeads, int32_t headDim, int32_t paddedSeqLen, cudaStream_t stream);

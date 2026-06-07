@@ -193,7 +193,9 @@ void launchSageAttentionFused(
     constexpr uint32_t K_BYTES = CTA_K * HEAD_DIM;
     constexpr uint32_t V_BYTES = HEAD_DIM * CTA_K;
     constexpr uint32_t TEMP_BYTES = CTA_K * HEAD_DIM * 2;
-    size_t smemSize = Q_BYTES + K_BYTES + V_BYTES + TEMP_BYTES;
+    constexpr uint32_t NUM_THREADS = 32 * NUM_WARPS; // 128
+    constexpr uint32_t REDUCTION_BYTES = NUM_THREADS * sizeof(float) + sizeof(float); // sKRed + sKMax
+    size_t smemSize = Q_BYTES + K_BYTES + V_BYTES + TEMP_BYTES + REDUCTION_BYTES;
 
     cudaError_t attrErr = cudaFuncSetAttribute(kernelFunc,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smemSize);

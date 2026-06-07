@@ -52,6 +52,9 @@ __global__ void sage_attn_fused_kernel(
     constexpr uint32_t V_OFFSET = K_OFFSET + K_BYTES;
     constexpr uint32_t V_BYTES = HEAD_DIM * V_SMEM_STRIDE;
     constexpr uint32_t TEMP_OFFSET = V_OFFSET + V_BYTES;
+    // Put reduction buffers at end of extern smem to avoid __shared__ static smem
+    constexpr uint32_t REDUCTION_OFFSET = TEMP_OFFSET + CTA_K * HEAD_DIM * sizeof(half);
+    constexpr uint32_t TOTAL_SMEM = REDUCTION_OFFSET + NUM_THREADS * sizeof(float) + sizeof(float);
 
     extern __shared__ int8_t smem[];
 
@@ -114,14 +117,6 @@ __global__ void sage_attn_fused_kernel(
         get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K + lane_id % 8 + (lane_id / 16) * 8,
         (lane_id / 8) % 2);
 
-    // Preload Q to registers (num_tiles_qk_inner=4 for headDim=128)
-    uint32_t RQ[num_tiles_q][4];
-    uint32_t QK_off_Q = Q_mma_off;
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-        smem_Q.ldmatrix_m8n8x4(QK_off_Q, RQ[fq]);
-        QK_off_Q = smem_Q.advance_offset_by_row<16>(QK_off_Q);
-    }
-
     // KV cache addressing
     uint32_t kv_head = head_id / num_kv_groups;
     uint32_t numKVHeads = num_qo_heads / num_kv_groups;
@@ -148,6 +143,7 @@ __global__ void sage_attn_fused_kernel(
         { m[fq][0] = m[fq][1] = -5000000.0f; d[fq][0] = d[fq][1] = 1.0f; }
 
     uint32_t num_iter = div_ceil(effective_kv_len, CTA_K);
+    uint32_t K_idx_lane_base = get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K + 2 * (lane_id % 4);
 
     // ===== MAIN LOOP =====
     for (uint32_t iter = 0; iter < num_iter; iter++)
@@ -168,7 +164,8 @@ __global__ void sage_attn_fused_kernel(
         __syncthreads();
 
         // --- Compute per-tile K scale ---
-        __shared__ float sKMax;
+        float* sKRed = reinterpret_cast<float*>(smem + REDUCTION_OFFSET);
+        float& sKMax = *reinterpret_cast<float*>(smem + REDUCTION_OFFSET + NUM_THREADS * sizeof(float));
         if (tid == 0) sKMax = 0.0f;
         __syncthreads();
 
@@ -179,7 +176,6 @@ __global__ void sage_attn_fused_kernel(
             threadKMax = fmaxf(threadKMax, fabsf(v));
         }
 
-        __shared__ float sKRed[NUM_THREADS];
         sKRed[tid] = threadKMax;
         __syncthreads();
         for (uint32_t s = NUM_THREADS / 2; s > 0; s >>= 1) {
@@ -187,6 +183,12 @@ __global__ void sage_attn_fused_kernel(
             __syncthreads();
         }
         float kScale = fmaxf(sKRed[0] / 127.0f, 1.0e-6f);
+
+        // --- Zero-init K smem (needed for partial KV: uncovered rows get qi=0) ---
+        for (uint32_t i = tid; i < CTA_K * HEAD_DIM; i += NUM_THREADS) {
+            *reinterpret_cast<int8_t*>(smem + K_OFFSET + i) = 0;
+        }
+        __syncthreads();
 
         // --- Quantize K: temp FP16 → swizzled K smem INT8 ---
         // Must match load_global_to_share lane-to-element mapping exactly
@@ -207,12 +209,16 @@ __global__ void sage_attn_fused_kernel(
                             uint32_t dim = dim0 + e * 4 + b;
                             int8_t qi = 0;
                             if (row < CTA_K && dim < HEAD_DIM) {
-                                float fv = __half2float(temp[row * HEAD_DIM + dim]);
-                                // K-mean centering: subtract per-channel mean (smooth_k)
-                                float km = (k_mean != nullptr)
-                                    ? k_mean[(uint64_t)batch_id * numKVHeads * HEAD_DIM + (uint64_t)kv_head * HEAD_DIM + dim]
-                                    : 0.0f;
-                                qi = (int8_t)min(127.0f, max(-127.0f, nearbyintf((fv - km) / kScale)));
+                                // OOB positions: force K_INT8=0 to prevent leakage
+                                if (row >= num_valid) {
+                                    qi = 0;
+                                } else {
+                                    float fv = __half2float(temp[row * HEAD_DIM + dim]);
+                                    float km = (k_mean != nullptr)
+                                        ? k_mean[(uint64_t)batch_id * numKVHeads * HEAD_DIM + (uint64_t)kv_head * HEAD_DIM + dim]
+                                        : 0.0f;
+                                    qi = (int8_t)min(127.0f, max(-127.0f, nearbyintf((fv - km) / kScale)));
+                                }
                             }
                             word |= ((uint32_t)(uint8_t)qi) << (b * 8);
                         }
@@ -229,7 +235,17 @@ __global__ void sage_attn_fused_kernel(
         float dequant_scale = q_scale * kScale;
         sm_scale = orig_sm * dequant_scale;
 
-        // --- Load FP16 V from KV cache → same temp smem ---
+        // --- Load FP16 V from KV cache → LINEAR temp smem ---
+        // Alignment derivation:
+        //   RS_32_to_8 permutes the sequence dimension by
+        //     perm = [0,1,4,5,8,9,12,13,2,3,6,7,10,11,14,15]   (within each 16-wide group)
+        //   so RS_smem[r, k] = RS_logical[r, perm(k)].
+        //   For PV matmul to be correct we need V_smem[k, d] = V_logical[perm(k), d].
+        //   The V quantization loop below already reads temp at index `perm(k)`, so
+        //   `temp` must hold V in *logical* (linear) order — NOT pre-permuted.
+        //   The previous version pre-permuted here, which combined with the
+        //   permutation in the quantizer cancelled out and stored V_smem in
+        //   logical order — misaligned with RS_smem and causing 25% wrong outputs.
         for (uint32_t i = tid; i < CTA_K * HEAD_DIM; i += NUM_THREADS)
         {
             uint32_t seq_in_tile = i / HEAD_DIM;
@@ -262,11 +278,16 @@ __global__ void sage_attn_fused_kernel(
                         uint32_t word = 0;
                         for (uint32_t b = 0; b < 4; b++) {
                             uint32_t logical_seq = seq_col * 16 + e * 4 + b;
-                            // Apply SageAttention V sequence permutation to match RS_32_to_8 order
-                            // [0,1,4,5,8,9,12,13,2,3,6,7,10,11,14,15]
+                            // SageAttention writes V_global at row perm(token), so the
+                            // kernel-side smem layout is smem_V[d, j] = V_logical[d, perm^{-1}(j)].
+                            // perm forward: bits b3 b2 b1 b0 -> b2 b1 b3 b0
+                            // perm inverse: bits c3 c2 c1 c0 -> c1 c3 c2 c0
                             uint32_t mod16 = logical_seq % 16;
-                            uint32_t ps = (mod16 / 8) * 2 + ((mod16 / 2) % 4) * 4 + (mod16 % 2);
-                            uint32_t seq_in_tile = (logical_seq / 16) * 16 + ps;
+                            uint32_t inv_ps = ((mod16 >> 1) & 1) * 8
+                                            + ((mod16 >> 3) & 1) * 4
+                                            + ((mod16 >> 2) & 1) * 2
+                                            + (mod16 & 1);
+                            uint32_t seq_in_tile = (logical_seq / 16) * 16 + inv_ps;
                             int8_t f8v = 0;
                             if (dim_group < HEAD_DIM && seq_in_tile < CTA_K) {
                                 float fv = __half2float(temp[seq_in_tile * HEAD_DIM + dim_group]);
@@ -301,11 +322,11 @@ __global__ void sage_attn_fused_kernel(
                 for (uint32_t k = 0; k < 8; k++)
                     RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]) * dequant_scale;
 
-        // --- Out-of-bound mask for last tile ---
-        if (num_valid < CTA_K)
-            apply_out_of_bound_mask<num_tiles_q, num_tiles_k, float>(
-                get_warp_idx_k<num_warps_q, num_warps_k>() * WARP_K + 2 * (lane_id % 4),
-                RS_f32, num_valid);
+        // --- Out-of-bound mask (same as original kernel: unconditional, global effective_kv_len) ---
+        apply_out_of_bound_mask<num_tiles_q, num_tiles_k, float>(
+            K_idx_lane_base, RS_f32, effective_kv_len);
+        K_idx_lane_base += CTA_K;
+
 
         // --- Softmax ---
         update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false, float>(
@@ -321,6 +342,7 @@ __global__ void sage_attn_fused_kernel(
         // --- PV Matmul ---
         compute_fp8_sv<num_warps_q, num_warps_k, num_tiles_q, num_tiles_k, num_tiles_v,
             sw_v, V_SMEM_STRIDE / 16, float>(smem_V, RS_f8, RO, d);
+
         __syncthreads();
     }
 
@@ -354,15 +376,30 @@ __global__ void sage_attn_fused_kernel(
     constexpr uint32_t o_smem_row_iters = O_SMEM_STRIDE / (line_lanes_o * 8);
     constexpr uint32_t o_smem_col_iters = CTA_Q / (num_warps * copy_lines_o);
 
-    // Store RO to smem_O
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-        for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
-            uint32_t sw_off = smem_O.get_permuted_offset(
-                get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + fq * 16 + lane_id % 16,
-                lane_id / 16 + fv * 2);
-            half packed[8];
-            for (uint32_t k = 0; k < 8; k++) packed[k] = __float2half_rn(RO[fq][fv][k]);
-            smem_O.base[sw_off] = *(uint4*)packed;
+    // Store RO → smem_O matching the original SageAttention kernel layout.
+    // m16n16 mma output places RO[8] across 32 lanes such that:
+    //   row = warp_q*WARP_Q + fq*16 + lane_id/4
+    //   col-pair offset within tile = lane_id % 4
+    // The smem layout is [CTA_Q, HEAD_DIM] in half, with PACK_SIZE_O=8 halves per cell
+    // (= 16 bytes), so each (row, col_cell) holds 4 uint32 packed halves; the lane writes
+    // its (lane_id % 4)-th uint32 in that cell.
+    {
+        uint32_t smem_O_row_base = get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / 4;
+        for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+            for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
+                // Two col-cells per fv (16 halves wide, PACK_SIZE_O=8 halves per cell).
+                uint32_t offset_O = smem_O.get_permuted_offset(smem_O_row_base + fq * 16, fv * 2);
+                uint32_t RO_f16[4];
+                ((half2*)RO_f16)[0] = __float22half2_rn(((float2*)RO[fq][fv])[0]);
+                ((half2*)RO_f16)[1] = __float22half2_rn(((float2*)RO[fq][fv])[1]);
+                ((half2*)RO_f16)[2] = __float22half2_rn(((float2*)RO[fq][fv])[2]);
+                ((half2*)RO_f16)[3] = __float22half2_rn(((float2*)RO[fq][fv])[3]);
+                ((uint32_t*)(smem_O.base + offset_O))[lane_id % 4] = RO_f16[0];
+                ((uint32_t*)(smem_O.base + offset_O + 8 * (O_SMEM_STRIDE / 8)))[lane_id % 4] = RO_f16[1];
+                offset_O = smem_O.get_permuted_offset(smem_O_row_base + fq * 16, fv * 2 + 1);
+                ((uint32_t*)(smem_O.base + offset_O))[lane_id % 4] = RO_f16[2];
+                ((uint32_t*)(smem_O.base + offset_O + 8 * (O_SMEM_STRIDE / 8)))[lane_id % 4] = RO_f16[3];
+            }
         }
     }
     __syncthreads();
