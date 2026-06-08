@@ -202,6 +202,19 @@ __global__ void sage_attn_fused_kernel(
                     uint32_t col = lane_id % line_lanes_qk;
                     uint32_t dim0 = col * 16;
 
+                    // Pre-compute kMeanInt = round(kMean/kScale) for two-step centering
+                    int32_t kMeanInt[16] = {0};
+                    if (k_mean != nullptr)
+                    {
+                        float rcpScale = 1.0f / kScale;
+                        for (int d = 0; d < 16; d++)
+                        {
+                            uint32_t dim = dim0 + d;
+                            float km = k_mean[(uint64_t)batch_id * numKVHeads * HEAD_DIM + (uint64_t)kv_head * HEAD_DIM + dim];
+                            kMeanInt[d] = (int32_t)nearbyintf(km * rcpScale);
+                        }
+                    }
+
                     uint32_t packed[4];
                     for (uint32_t e = 0; e < 4; e++) {
                         uint32_t word = 0;
@@ -209,15 +222,16 @@ __global__ void sage_attn_fused_kernel(
                             uint32_t dim = dim0 + e * 4 + b;
                             int8_t qi = 0;
                             if (row < CTA_K && dim < HEAD_DIM) {
-                                // OOB positions: force K_INT8=0 to prevent leakage
                                 if (row >= num_valid) {
                                     qi = 0;
                                 } else {
                                     float fv = __half2float(temp[row * HEAD_DIM + dim]);
-                                    float km = (k_mean != nullptr)
-                                        ? k_mean[(uint64_t)batch_id * numKVHeads * HEAD_DIM + (uint64_t)kv_head * HEAD_DIM + dim]
-                                        : 0.0f;
-                                    qi = (int8_t)min(127.0f, max(-127.0f, nearbyintf((fv - km) / kScale)));
+                                    // Two-step: round(K/kScale) - round(kMean/kScale), matching convert pipeline
+                                    int32_t qi_raw = (int32_t)nearbyintf(fv / kScale);
+                                    if (k_mean != nullptr)
+                                        qi = (int8_t)min(127, max(-127, qi_raw - kMeanInt[e * 4 + b]));
+                                    else
+                                        qi = (int8_t)min(127, max(-127, qi_raw));
                                 }
                             }
                             word |= ((uint32_t)(uint8_t)qi) << (b * 8);
@@ -292,8 +306,12 @@ __global__ void sage_attn_fused_kernel(
                             if (dim_group < HEAD_DIM && seq_in_tile < CTA_K) {
                                 float fv = __half2float(temp[seq_in_tile * HEAD_DIM + dim_group]);
                                 float vs = v_scale_head[dim_group];
-                                __nv_fp8_e4m3 fp8(fv / vs);
-                                f8v = *(int8_t*)&fp8;
+                                // Double fp8 conversion matching convert pipeline:
+                                // 1) fp8(V_raw) → 2) float → 3) /vScale → 4) fp8
+                                __nv_fp8_e4m3 fp8_raw(fv);
+                                float fv_raw = (float)fp8_raw;
+                                __nv_fp8_e4m3 fp8_scaled(fv_raw / vs);
+                                f8v = *(int8_t*)&fp8_scaled;
                             }
                             word |= ((uint32_t)(uint8_t)f8v) << (b * 8);
                         }
@@ -404,19 +422,23 @@ __global__ void sage_attn_fused_kernel(
     }
     __syncthreads();
 
-    // Copy smem_O → global O
+    // Copy smem_O → global O (with predicate to prevent OOB writes)
     DTypeOut *O_lane = O + batch_id * stride_bz_o + head_id * stride_h_o
         + (CTA_Q / num_warps * warp_id + lane_id / line_lanes_o) * stride_seq_o
         + (lane_id % line_lanes_o) * 8;
+    uint32_t O_load_idx = CTA_Q / num_warps * warp_id + lane_id / line_lanes_o;
 
     for (uint32_t ci = 0; ci < o_smem_col_iters; ci++) {
         for (uint32_t ri = 0; ri < o_smem_row_iters; ri++) {
-            uint32_t sw_off = smem_O.get_permuted_offset(
-                warp_id * copy_lines_o * o_smem_col_iters + ci * copy_lines_o + ri,
-                lane_id % line_lanes_o);
-            *(uint4*)O_lane = smem_O.base[sw_off];
+            if (O_load_idx < qo_len) {
+                uint32_t sw_off = smem_O.get_permuted_offset(
+                    warp_id * copy_lines_o * o_smem_col_iters + ci * copy_lines_o + ri,
+                    lane_id % line_lanes_o);
+                *(uint4*)O_lane = smem_O.base[sw_off];
+            }
             O_lane += line_lanes_o * 8;
         }
         O_lane += (copy_lines_o * stride_seq_o) - (o_smem_row_iters * line_lanes_o * 8);
+        O_load_idx += copy_lines_o;
     }
 }

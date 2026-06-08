@@ -925,14 +925,13 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                     kvCacheTensor, contextLengthTensor, kInt8Tensor, vFp8Tensor, kScaleTensor,
                     vScaleTensor, kMeanTensor, partialVMaxTensor, partialKSumTensor, kvLen, stream);
 
-#if 1  /* TEMP-DIAG: run fused on the same KV cache and compare against pre-fusion runner */
+#if 1  /* DIAG: fused vs pre-fusion with double fp8 V */
                 {
                     int32_t const oCount = runtimeBatchSize * qoLen * mNumQHeads * mHeadSize;
                     int32_t const strideBzQ = qoLen * mNumQHeads * mHeadSize;
                     int32_t const strideSeqQ = mNumQHeads * mHeadSize;
                     float const smScaleF = 1.0f / std::sqrt(static_cast<float>(mHeadSize));
-                    // Use the same V-scale and K-mean as the pre-fusion runner (computed by
-                    // launchSageConvertKVCacheToInt8AndFp8 above) so the only diff is the kernel itself.
+                    // 1. FUSED
                     sage::launchSageAttentionFused(
                         qInt8Tensor.dataPointer<int8_t>(), static_cast<half const*>(kvCacheTensor.rawPointer()),
                         attentionOutputTensor.dataPointer<half>(), qScaleTensor.dataPointer<float>(),
@@ -940,64 +939,37 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                         contextLengthTensor.dataPointer<int32_t>(),
                         runtimeBatchSize, mNumQHeads, mNumKVHeads, kvCacheCapacity,
                         strideBzQ, strideSeqQ, mHeadSize, strideBzQ, strideSeqQ, mHeadSize, smScaleF, stream);
-                    std::vector<half> fusedOut(oCount);
                     CUDA_CHECK(cudaStreamSynchronize(stream));
-                    CUDA_CHECK(cudaMemcpy(fusedOut.data(), attentionOutputTensor.rawPointer(),
-                        oCount * sizeof(half), cudaMemcpyDeviceToHost));
-
-                    // Now run the proven pre-fusion path; this overwrites attentionOutput.
+                    std::vector<half> fusedOut(oCount);
+                    CUDA_CHECK(cudaMemcpy(fusedOut.data(), attentionOutputTensor.rawPointer(), oCount*2, cudaMemcpyDeviceToHost));
+                    // 2. PRE-FUSION
                     SageAttentionParams sp{};
-                    sp.q_ptr = qInt8Tensor.dataPointer<int8_t>();
-                    sp.k_ptr = kInt8Tensor.dataPointer<int8_t>();
-                    sp.v_ptr = vFp8Tensor.dataPointer<int8_t>();
-                    sp.o_ptr = attentionOutputTensor.rawPointer();
-                    sp.q_scale_ptr = qScaleTensor.dataPointer<float>();
-                    sp.k_scale_ptr = kScaleTensor.dataPointer<float>();
-                    sp.v_scale_ptr = vScaleTensor.dataPointer<float>();
-                    sp.fuse_v_scale = true;
+                    sp.q_ptr = qInt8Tensor.dataPointer<int8_t>(); sp.k_ptr = kInt8Tensor.dataPointer<int8_t>();
+                    sp.v_ptr = vFp8Tensor.dataPointer<int8_t>(); sp.o_ptr = attentionOutputTensor.rawPointer();
+                    sp.q_scale_ptr = qScaleTensor.dataPointer<float>(); sp.k_scale_ptr = kScaleTensor.dataPointer<float>();
+                    sp.v_scale_ptr = vScaleTensor.dataPointer<float>(); sp.fuse_v_scale = true;
                     sp.sequence_lengths = contextLengthTensor.dataPointer<int32_t>();
                     sp.batch_size = runtimeBatchSize; sp.qo_len = qoLen; sp.kv_len = kvLen;
                     sp.num_qo_heads = mNumQHeads; sp.num_kv_heads = mNumKVHeads; sp.head_dim = mHeadSize;
                     sp.sm_scale = smScaleF;
                     sp.tensor_layout = SageTensorLayout::kBSHD; sp.mask_mode = SageMaskMode::kNone;
                     sp.qk_quant_gran = SageQuantGranularity::kPerWarp;
-                    sp.stride_bz_q = qoLen*mNumQHeads*mHeadSize; sp.stride_seq_q = mNumQHeads*mHeadSize; sp.stride_h_q = mHeadSize;
+                    sp.stride_bz_q = strideBzQ; sp.stride_seq_q = strideSeqQ; sp.stride_h_q = mHeadSize;
                     sp.stride_bz_k = kvLen*mNumKVHeads*mHeadSize; sp.stride_seq_k = mNumKVHeads*mHeadSize; sp.stride_h_k = mHeadSize;
                     sp.stride_bz_v = mHeadSize*mNumKVHeads*paddedKvLen; sp.stride_h_v = paddedKvLen; sp.stride_d_v = mNumKVHeads*paddedKvLen;
-                    sp.stride_bz_o = qoLen*mNumQHeads*mHeadSize; sp.stride_seq_o = mNumQHeads*mHeadSize; sp.stride_h_o = mHeadSize;
+                    sp.stride_bz_o = strideBzQ; sp.stride_seq_o = strideSeqQ; sp.stride_h_o = mHeadSize;
                     SageAttentionRunner sr(mDataType, runtimeBatchSize, qoLen, kvLen, mNumQHeads, mNumKVHeads,
                         mHeadSize, mSMVersion, SageTensorLayout::kBSHD, SageMaskMode::kNone, SageQuantGranularity::kPerWarp);
                     sr.run(sp, nullptr, stream);
-
-                    std::vector<half> preOut(oCount);
                     CUDA_CHECK(cudaStreamSynchronize(stream));
-                    CUDA_CHECK(cudaMemcpy(preOut.data(), attentionOutputTensor.rawPointer(),
-                        oCount * sizeof(half), cudaMemcpyDeviceToHost));
-
-                    int32_t effKv = 0;
-                    CUDA_CHECK(cudaMemcpy(&effKv, contextLengthTensor.rawPointer(), sizeof(int32_t), cudaMemcpyDeviceToHost));
-
-                    static int s_call = 0;
-                    int callId = s_call++;
-                    float maxAbs = 0, sumAbs = 0, sumP = 0;
-                    int nMis = 0; int firstBad = -1; float firstBadF = 0, firstBadP = 0;
-                    for (int i = 0; i < oCount; i++) {
-                        float f = __half2float(fusedOut[i]);
-                        float p = __half2float(preOut[i]);
-                        float ad = fabsf(f - p);
-                        sumAbs += ad; sumP += fabsf(p);
-                        if (ad > maxAbs) maxAbs = ad;
-                        if (ad > 0.01f * fmaxf(fabsf(p), 0.01f)) {
-                            if (firstBad < 0) { firstBad = i; firstBadF = f; firstBadP = p; }
-                            nMis++;
-                        }
-                    }
-                    if (callId < 30 || (callId % 28 == 0)) {
-                        printf("[FUSED_VS_PRE] call=%d effKv=%d maxAbsDiff=%.4f relErr=%.4f mismatchPct=%.1f%% firstBad=%d (fused=%.4f pre=%.4f)\n",
-                            callId, effKv, maxAbs, (sumP > 0 ? sumAbs / sumP : 0.f),
-                            100.0f * nMis / oCount, firstBad, firstBadF, firstBadP);
-                        fflush(stdout);
-                    }
+                    std::vector<half> preOut(oCount);
+                    CUDA_CHECK(cudaMemcpy(preOut.data(), attentionOutputTensor.rawPointer(), oCount*2, cudaMemcpyDeviceToHost));
+                    // 3. COMPARE
+                    static int s_call=0; int cid=s_call++;
+                    float md=0; int nm=0;
+                    for(int i=0;i<oCount;i++){float f=__half2float(fusedOut[i]),p=__half2float(preOut[i]);float ad=fabsf(f-p);md=fmaxf(md,ad);if(ad>0.01f*fmaxf(fabsf(p),0.01f))nm++;}
+                    printf("[FUSED_VS_PRE] c%d maxAbs=%.4f mis=%.1f%% f0=%.4f p0=%.4f\n",cid,md,100.f*nm/oCount,__half2float(fusedOut[0]),__half2float(preOut[0]));
+                    fflush(stdout);
                 }
                 return 0;
 #else
