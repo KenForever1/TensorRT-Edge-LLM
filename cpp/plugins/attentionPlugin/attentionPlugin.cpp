@@ -980,6 +980,8 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                            cid,md,sqrtf(rms/oCount),100.f*nm/oCount,__half2float(fusedOut[0]),__half2float(preOut[0]),
                            seqIdx,h,d);
                     fflush(stdout);
+                    // Use FUSED output for generation (overwrite pre-fusion result)
+                    CUDA_CHECK(cudaMemcpy(attentionOutputTensor.rawPointer(), fusedOut.data(), oCount*2, cudaMemcpyHostToDevice));
                 }
                 return 0;
 #else

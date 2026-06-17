@@ -105,6 +105,12 @@ __global__ void sage_attn_fused_kernel(
         warp_id * copy_lines_v * v_smem_col_iters + lane_id / line_lanes_v,
         lane_id % line_lanes_v);
 
+    // Zero-init Q smem: garbage rows produce zero QK scores → zero attention
+    for (uint32_t i = tid; i < Q_BYTES; i += NUM_THREADS) {
+        smem[i] = 0;
+    }
+    __syncthreads();
+
     // Load Q (same as original)
     load_global_to_share<line_lanes_qk, copy_lines_qk, 1, q_smem_col_iters,
         sw_qk, QK_SMEM_STRIDE / 16, CTA_Q>(
@@ -350,10 +356,10 @@ __global__ void sage_attn_fused_kernel(
         update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false, float>(
             RS_f32, RO, m, d, sm_scale);
 
-        // --- RS float → FP8, accumulate denominator ---
+        // --- RS float → FP8 for PV matmul, CUDA-core accumulate denominator ---
         uint32_t RS_f8[num_tiles_q][num_tiles_k / 2][4];
         RS_32_to_8<num_tiles_q, num_tiles_k>(RS_f32, RS_f8);
-        accumulate_d_f8<num_tiles_q, num_tiles_k>(RS_f8, d);
+        accumulate_d<num_tiles_q, num_tiles_k, ComputeUnit::kCudaCore>(RS_f32, d);
 
         __syncthreads();
 
@@ -365,7 +371,7 @@ __global__ void sage_attn_fused_kernel(
     }
 
     // === Normalize ===
-    normalize_d<num_tiles_q, num_tiles_v, ComputeUnit::kTensorCore, float, float>(RO, m, d);
+    normalize_d<num_tiles_q, num_tiles_v, ComputeUnit::kCudaCore, float, float>(RO, m, d);
 
     // === fuse_v_scale ===
     if constexpr (FUSE_V_SCALE)
