@@ -925,7 +925,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                     kvCacheTensor, contextLengthTensor, kInt8Tensor, vFp8Tensor, kScaleTensor,
                     vScaleTensor, kMeanTensor, partialVMaxTensor, partialKSumTensor, kvLen, stream);
 
-#if 1  /* DIAG: fused vs pre-fusion with double fp8 V */
+#if 0  /* DIAG: fused vs pre-fusion (set to 1 to compare) */
                 {
                     int32_t const oCount = runtimeBatchSize * qoLen * mNumQHeads * mHeadSize;
                     int32_t const strideBzQ = qoLen * mNumQHeads * mHeadSize;
@@ -985,43 +985,17 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                 }
                 return 0;
 #else
-                SageAttentionParams sageParams{};
-                sageParams.q_ptr = qInt8Tensor.dataPointer<int8_t>();
-                sageParams.k_ptr = kInt8Tensor.dataPointer<int8_t>();
-                sageParams.v_ptr = vFp8Tensor.dataPointer<int8_t>();
-                sageParams.o_ptr = attentionOutputTensor.rawPointer();
-                sageParams.q_scale_ptr = qScaleTensor.dataPointer<float>();
-                sageParams.k_scale_ptr = kScaleTensor.dataPointer<float>();
-                sageParams.v_scale_ptr = vScaleTensor.dataPointer<float>();
-                sageParams.fuse_v_scale = true;
-                sageParams.sequence_lengths = contextLengthTensor.dataPointer<int32_t>();
-                sageParams.batch_size = runtimeBatchSize;
-                sageParams.qo_len = qoLen;
-                sageParams.kv_len = kvLen;
-                sageParams.num_qo_heads = mNumQHeads;
-                sageParams.num_kv_heads = mNumKVHeads;
-                sageParams.head_dim = mHeadSize;
-                sageParams.sm_scale = 1.0f / std::sqrt(static_cast<float>(mHeadSize));
-                sageParams.tensor_layout = SageTensorLayout::kBSHD;
-                sageParams.mask_mode = SageMaskMode::kNone;
-                sageParams.qk_quant_gran = SageQuantGranularity::kPerWarp;
-                sageParams.stride_bz_q = qoLen * mNumQHeads * mHeadSize;
-                sageParams.stride_seq_q = mNumQHeads * mHeadSize;
-                sageParams.stride_h_q = mHeadSize;
-                sageParams.stride_bz_k = kvLen * mNumKVHeads * mHeadSize;
-                sageParams.stride_seq_k = mNumKVHeads * mHeadSize;
-                sageParams.stride_h_k = mHeadSize;
-                sageParams.stride_bz_v = mHeadSize * mNumKVHeads * paddedKvLen;
-                sageParams.stride_h_v = paddedKvLen;
-                sageParams.stride_d_v = mNumKVHeads * paddedKvLen;
-                sageParams.stride_bz_o = qoLen * mNumQHeads * mHeadSize;
-                sageParams.stride_seq_o = mNumQHeads * mHeadSize;
-                sageParams.stride_h_o = mHeadSize;
-
-                SageAttentionRunner sageRunner(mDataType, runtimeBatchSize, qoLen, kvLen, mNumQHeads, mNumKVHeads,
-                    mHeadSize, mSMVersion, SageTensorLayout::kBSHD, SageMaskMode::kNone,
-                    SageQuantGranularity::kPerWarp);
-                sageRunner.run(sageParams, nullptr, stream);
+                // Production: fused SageAttention kernel
+                int32_t const strideBzQ = qoLen * mNumQHeads * mHeadSize;
+                int32_t const strideSeqQ = mNumQHeads * mHeadSize;
+                float const smScaleF = 1.0f / std::sqrt(static_cast<float>(mHeadSize));
+                sage::launchSageAttentionFused(
+                    qInt8Tensor.dataPointer<int8_t>(), static_cast<half const*>(kvCacheTensor.rawPointer()),
+                    attentionOutputTensor.dataPointer<half>(), qScaleTensor.dataPointer<float>(),
+                    vScaleTensor.dataPointer<float>(), kMeanTensor.dataPointer<float>(),
+                    contextLengthTensor.dataPointer<int32_t>(),
+                    runtimeBatchSize, mNumQHeads, mNumKVHeads, kvCacheCapacity,
+                    strideBzQ, strideSeqQ, mHeadSize, strideBzQ, strideSeqQ, mHeadSize, smScaleF, stream);
                 return 0;
 #endif
             }

@@ -370,6 +370,19 @@ __global__ void sage_attn_fused_kernel(
         __syncthreads();
     }
 
+    // === Fixup: replicate k-group 0 to k-group 1 (Q smem zero → garbage rows) ===
+    // Q smem zero-init causes garbage Q rows to produce all-zero QK scores →
+    // uniform softmax → mean(V). Copy valid row's RO and d to garbage positions.
+    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
+        for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
+            RO[fq][fv][2] = RO[fq][fv][0];
+            RO[fq][fv][3] = RO[fq][fv][1];
+            RO[fq][fv][6] = RO[fq][fv][4];
+            RO[fq][fv][7] = RO[fq][fv][5];
+        }
+        d[fq][1] = d[fq][0];
+    }
+
     // === Normalize ===
     normalize_d<num_tiles_q, num_tiles_v, ComputeUnit::kCudaCore, float, float>(RO, m, d);
 
