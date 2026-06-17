@@ -27,14 +27,15 @@ set(CMAKE_CUDA_FLAGS_DEBUG "-g")
 # architectures will be compiled.
 # ------------------------------------------------------------------------------
 set(FMHA_ALL_SM_VERSIONS
-    80
-    86
-    87
+    # 80
+    # 86
+    # 87
     89
-    100
-    101
-    120
-    121)
+    # 100
+    # 101
+    # 120
+    # 121
+    )
 set(FMHA_EXCLUDE_DEFINITIONS "")
 
 # Build a list of required FMHA SM versions based on target architectures. Some

@@ -966,9 +966,19 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                     CUDA_CHECK(cudaMemcpy(preOut.data(), attentionOutputTensor.rawPointer(), oCount*2, cudaMemcpyDeviceToHost));
                     // 3. COMPARE
                     static int s_call=0; int cid=s_call++;
-                    float md=0; int nm=0;
-                    for(int i=0;i<oCount;i++){float f=__half2float(fusedOut[i]),p=__half2float(preOut[i]);float ad=fabsf(f-p);md=fmaxf(md,ad);if(ad>0.01f*fmaxf(fabsf(p),0.01f))nm++;}
-                    printf("[FUSED_VS_PRE] c%d maxAbs=%.4f mis=%.1f%% f0=%.4f p0=%.4f\n",cid,md,100.f*nm/oCount,__half2float(fusedOut[0]),__half2float(preOut[0]));
+                    float md=0, rms=0; int nm=0, maxIdx=0;
+                    for(int i=0;i<oCount;i++){
+                        float f=__half2float(fusedOut[i]),p=__half2float(preOut[i]);
+                        float ad=fabsf(f-p); if(ad>md){md=ad; maxIdx=i;}
+                        rms+=ad*ad;
+                        if(ad>0.01f*fmaxf(fabsf(p),0.01f))nm++;
+                    }
+                    int h = (maxIdx / mHeadSize) % mNumQHeads;
+                    int d = maxIdx % mHeadSize;
+                    int seqIdx = maxIdx / (mNumQHeads * mHeadSize);
+                    printf("[FUSED_VS_PRE] c%d maxAbs=%.4f rms=%.4f mis=%.1f%% f0=%.4f p0=%.4f max@seq=%d,h=%d,d=%d\n",
+                           cid,md,sqrtf(rms/oCount),100.f*nm/oCount,__half2float(fusedOut[0]),__half2float(preOut[0]),
+                           seqIdx,h,d);
                     fflush(stdout);
                 }
                 return 0;

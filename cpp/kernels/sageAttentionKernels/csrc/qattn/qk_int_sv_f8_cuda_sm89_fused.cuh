@@ -198,7 +198,7 @@ __global__ void sage_attn_fused_kernel(
             {
                 for (uint32_t ri = 0; ri < qk_smem_row_iters; ri++)
                 {
-                    uint32_t row = warp_id * copy_lines_qk * k_smem_col_iters + ci * copy_lines_qk + ri;
+                    uint32_t row = warp_id * copy_lines_qk * k_smem_col_iters + lane_id / line_lanes_qk + ci * copy_lines_qk + ri;
                     uint32_t col = lane_id % line_lanes_qk;
                     uint32_t dim0 = col * 16;
 
@@ -284,7 +284,7 @@ __global__ void sage_attn_fused_kernel(
             {
                 for (uint32_t ri = 0; ri < v_smem_row_iters; ri++)
                 {
-                    uint32_t dim_group = warp_id * copy_lines_v * v_smem_col_iters + ci * copy_lines_v + ri;
+                    uint32_t dim_group = warp_id * copy_lines_v * v_smem_col_iters + lane_id / line_lanes_v + ci * copy_lines_v + ri;
                     uint32_t seq_col = lane_id % line_lanes_v;
 
                     uint32_t packed[4];
@@ -333,12 +333,12 @@ __global__ void sage_attn_fused_kernel(
                 smem_Q, smem_K, RS, Q_mma_off, QK_off_K);
         }
 
-        // --- Convert int32 → float with dequant ---
+        // --- Convert int32 → float (matching reference kernel main loop: no dequant here) ---
         float RS_f32[num_tiles_q][num_tiles_k][8];
         for (uint32_t fq = 0; fq < num_tiles_q; fq++)
             for (uint32_t fk = 0; fk < num_tiles_k; fk++)
                 for (uint32_t k = 0; k < 8; k++)
-                    RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]) * dequant_scale;
+                    RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]);
 
         // --- Out-of-bound mask (same as original kernel: unconditional, global effective_kv_len) ---
         apply_out_of_bound_mask<num_tiles_q, num_tiles_k, float>(
@@ -346,9 +346,9 @@ __global__ void sage_attn_fused_kernel(
         K_idx_lane_base += CTA_K;
 
 
-        // --- Softmax ---
+        // --- Softmax (sm_scale includes dequant_scale, matching reference main loop) ---
         update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, true, false, float>(
-            RS_f32, RO, m, d, orig_sm);
+            RS_f32, RO, m, d, sm_scale);
 
         // --- RS float → FP8, accumulate denominator ---
         uint32_t RS_f8[num_tiles_q][num_tiles_k / 2][4];

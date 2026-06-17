@@ -25,6 +25,9 @@
 #include <cuda_runtime.h>
 #include <stdexcept>
 
+#undef NDEBUG  // 取消定义 NDEBUG 来启用断言
+#include <assert.h>
+
 namespace trt_edgellm
 {
 namespace sage

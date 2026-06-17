@@ -19,7 +19,18 @@
 #pragma once
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+// Workaround for CUDA 12.9+: cuda_fp8.hpp includes <assert.h> and uses assert() in
+// __host__ __device__ functions, which expands to glibc's __assert_fail not available
+// in device code. Temporarily disable assertions while the fp8 header is parsed.
+#ifndef NDEBUG
+#define SAGE_NUMERIC_CONV_TEMP_NDEBUG
+#define NDEBUG
+#endif
 #include <cuda_fp8.h>
+#ifdef SAGE_NUMERIC_CONV_TEMP_NDEBUG
+#undef NDEBUG
+#undef SAGE_NUMERIC_CONV_TEMP_NDEBUG
+#endif
 #include <cuda_runtime.h>
 #include <cuda/pipeline>
 
