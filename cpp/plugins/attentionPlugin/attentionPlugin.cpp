@@ -925,7 +925,7 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                     kvCacheTensor, contextLengthTensor, kInt8Tensor, vFp8Tensor, kScaleTensor,
                     vScaleTensor, kMeanTensor, partialVMaxTensor, partialKSumTensor, kvLen, stream);
 
-#if 0  /* DIAG: fused vs pre-fusion (set to 1 to compare) */
+#if 1  /* DIAG: re-enabled for verification */
                 {
                     int32_t const oCount = runtimeBatchSize * qoLen * mNumQHeads * mHeadSize;
                     int32_t const strideBzQ = qoLen * mNumQHeads * mHeadSize;

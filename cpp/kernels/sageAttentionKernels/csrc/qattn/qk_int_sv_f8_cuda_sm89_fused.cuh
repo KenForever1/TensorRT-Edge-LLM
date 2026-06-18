@@ -105,12 +105,6 @@ __global__ void sage_attn_fused_kernel(
         warp_id * copy_lines_v * v_smem_col_iters + lane_id / line_lanes_v,
         lane_id % line_lanes_v);
 
-    // Zero-init Q smem: garbage rows produce zero QK scores → zero attention
-    for (uint32_t i = tid; i < Q_BYTES; i += NUM_THREADS) {
-        smem[i] = 0;
-    }
-    __syncthreads();
-
     // Load Q (same as original)
     load_global_to_share<line_lanes_qk, copy_lines_qk, 1, q_smem_col_iters,
         sw_qk, QK_SMEM_STRIDE / 16, CTA_Q>(
@@ -368,19 +362,6 @@ __global__ void sage_attn_fused_kernel(
             sw_v, V_SMEM_STRIDE / 16, float>(smem_V, RS_f8, RO, d);
 
         __syncthreads();
-    }
-
-    // === Fixup: replicate k-group 0 to k-group 1 (Q smem zero → garbage rows) ===
-    // Q smem zero-init causes garbage Q rows to produce all-zero QK scores →
-    // uniform softmax → mean(V). Copy valid row's RO and d to garbage positions.
-    for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
-        for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
-            RO[fq][fv][2] = RO[fq][fv][0];
-            RO[fq][fv][3] = RO[fq][fv][1];
-            RO[fq][fv][6] = RO[fq][fv][4];
-            RO[fq][fv][7] = RO[fq][fv][5];
-        }
-        d[fq][1] = d[fq][0];
     }
 
     // === Normalize ===
