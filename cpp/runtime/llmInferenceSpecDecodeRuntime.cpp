@@ -1931,7 +1931,6 @@ bool LLMInferenceSpecDecodeRuntime::runDraftModelAcceptToken(SpecDecodeInference
 
 bool LLMInferenceSpecDecodeRuntime::captureDecodingCUDAGraph(cudaStream_t stream)
 {
-    return false;  // TEMP: focus on no-graph mode while debugging fused precision
     bool draftProposalCaptureStatus{true};
     bool draftAcceptCaptureStatus{true};
     bool baseVerificationCaptureStatus{true};

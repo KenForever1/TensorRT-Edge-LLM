@@ -39,6 +39,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -55,6 +56,7 @@ namespace
 {
 constexpr char const* kATTENTION_PLUGIN_VERSION{"1"};
 constexpr char const* kATTENTION_PLUGIN_NAME{"AttentionPlugin"};
+constexpr char const* kUSE_SAGE_ATTENTION_ENV{"EDGELLM_USE_SAGE_ATTENTION"};
 
 
 // Select KV cache storage datatype based on FP8 enablement
@@ -154,6 +156,15 @@ bool canUseSageDecode(AttentionExecutionMode executionMode, int32_t runtimeSeqLe
     nvinfer1::DataType dataType, int32_t headSize, int32_t numQHeads, int32_t numKVHeads, int32_t slidingWindowSize,
     int32_t enableTreeAttention, int32_t enableFp8KVCache) noexcept
 {
+    char const* useSageAttentionEnv = std::getenv(kUSE_SAGE_ATTENTION_ENV);
+    if (useSageAttentionEnv != nullptr && (std::strcmp(useSageAttentionEnv, "0") == 0
+            || std::strcmp(useSageAttentionEnv, "false") == 0 || std::strcmp(useSageAttentionEnv, "FALSE") == 0
+            || std::strcmp(useSageAttentionEnv, "off") == 0 || std::strcmp(useSageAttentionEnv, "OFF") == 0
+            || std::strcmp(useSageAttentionEnv, "no") == 0 || std::strcmp(useSageAttentionEnv, "NO") == 0))
+    {
+        return false;
+    }
+
     return executionMode == AttentionExecutionMode::kVANILLA_DECODING && runtimeSeqLen == 1 && enableTreeAttention == 0
         && enableFp8KVCache == 0 && slidingWindowSize <= 0 && numKVHeads > 0 && numQHeads % numKVHeads == 0
         && SageAttentionRunner::canImplement(headSize, smVersion, dataType);
@@ -925,66 +936,6 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                     kvCacheTensor, contextLengthTensor, kInt8Tensor, vFp8Tensor, kScaleTensor,
                     vScaleTensor, kMeanTensor, partialVMaxTensor, partialKSumTensor, kvLen, stream);
 
-#if 1  /* DIAG: re-enabled for verification */
-                {
-                    int32_t const oCount = runtimeBatchSize * qoLen * mNumQHeads * mHeadSize;
-                    int32_t const strideBzQ = qoLen * mNumQHeads * mHeadSize;
-                    int32_t const strideSeqQ = mNumQHeads * mHeadSize;
-                    float const smScaleF = 1.0f / std::sqrt(static_cast<float>(mHeadSize));
-                    // 1. FUSED
-                    sage::launchSageAttentionFused(
-                        qInt8Tensor.dataPointer<int8_t>(), static_cast<half const*>(kvCacheTensor.rawPointer()),
-                        attentionOutputTensor.dataPointer<half>(), qScaleTensor.dataPointer<float>(),
-                        vScaleTensor.dataPointer<float>(), kMeanTensor.dataPointer<float>(),
-                        contextLengthTensor.dataPointer<int32_t>(),
-                        runtimeBatchSize, mNumQHeads, mNumKVHeads, kvCacheCapacity,
-                        strideBzQ, strideSeqQ, mHeadSize, strideBzQ, strideSeqQ, mHeadSize, smScaleF, stream);
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
-                    std::vector<half> fusedOut(oCount);
-                    CUDA_CHECK(cudaMemcpy(fusedOut.data(), attentionOutputTensor.rawPointer(), oCount*2, cudaMemcpyDeviceToHost));
-                    // 2. PRE-FUSION
-                    SageAttentionParams sp{};
-                    sp.q_ptr = qInt8Tensor.dataPointer<int8_t>(); sp.k_ptr = kInt8Tensor.dataPointer<int8_t>();
-                    sp.v_ptr = vFp8Tensor.dataPointer<int8_t>(); sp.o_ptr = attentionOutputTensor.rawPointer();
-                    sp.q_scale_ptr = qScaleTensor.dataPointer<float>(); sp.k_scale_ptr = kScaleTensor.dataPointer<float>();
-                    sp.v_scale_ptr = vScaleTensor.dataPointer<float>(); sp.fuse_v_scale = true;
-                    sp.sequence_lengths = contextLengthTensor.dataPointer<int32_t>();
-                    sp.batch_size = runtimeBatchSize; sp.qo_len = qoLen; sp.kv_len = kvLen;
-                    sp.num_qo_heads = mNumQHeads; sp.num_kv_heads = mNumKVHeads; sp.head_dim = mHeadSize;
-                    sp.sm_scale = smScaleF;
-                    sp.tensor_layout = SageTensorLayout::kBSHD; sp.mask_mode = SageMaskMode::kNone;
-                    sp.qk_quant_gran = SageQuantGranularity::kPerWarp;
-                    sp.stride_bz_q = strideBzQ; sp.stride_seq_q = strideSeqQ; sp.stride_h_q = mHeadSize;
-                    sp.stride_bz_k = kvLen*mNumKVHeads*mHeadSize; sp.stride_seq_k = mNumKVHeads*mHeadSize; sp.stride_h_k = mHeadSize;
-                    sp.stride_bz_v = mHeadSize*mNumKVHeads*paddedKvLen; sp.stride_h_v = paddedKvLen; sp.stride_d_v = mNumKVHeads*paddedKvLen;
-                    sp.stride_bz_o = strideBzQ; sp.stride_seq_o = strideSeqQ; sp.stride_h_o = mHeadSize;
-                    SageAttentionRunner sr(mDataType, runtimeBatchSize, qoLen, kvLen, mNumQHeads, mNumKVHeads,
-                        mHeadSize, mSMVersion, SageTensorLayout::kBSHD, SageMaskMode::kNone, SageQuantGranularity::kPerWarp);
-                    sr.run(sp, nullptr, stream);
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
-                    std::vector<half> preOut(oCount);
-                    CUDA_CHECK(cudaMemcpy(preOut.data(), attentionOutputTensor.rawPointer(), oCount*2, cudaMemcpyDeviceToHost));
-                    // 3. COMPARE
-                    static int s_call=0; int cid=s_call++;
-                    float md=0, rms=0; int nm=0, maxIdx=0;
-                    for(int i=0;i<oCount;i++){
-                        float f=__half2float(fusedOut[i]),p=__half2float(preOut[i]);
-                        float ad=fabsf(f-p); if(ad>md){md=ad; maxIdx=i;}
-                        rms+=ad*ad;
-                        if(ad>0.01f*fmaxf(fabsf(p),0.01f))nm++;
-                    }
-                    int h = (maxIdx / mHeadSize) % mNumQHeads;
-                    int d = maxIdx % mHeadSize;
-                    int seqIdx = maxIdx / (mNumQHeads * mHeadSize);
-                    printf("[FUSED_VS_PRE] c%d maxAbs=%.4f rms=%.4f mis=%.1f%% f0=%.4f p0=%.4f max@seq=%d,h=%d,d=%d\n",
-                           cid,md,sqrtf(rms/oCount),100.f*nm/oCount,__half2float(fusedOut[0]),__half2float(preOut[0]),
-                           seqIdx,h,d);
-                    fflush(stdout);
-                    // Use FUSED output for generation (overwrite pre-fusion result)
-                    CUDA_CHECK(cudaMemcpy(attentionOutputTensor.rawPointer(), fusedOut.data(), oCount*2, cudaMemcpyHostToDevice));
-                }
-                return 0;
-#else
                 // Production: fused SageAttention kernel
                 int32_t const strideBzQ = qoLen * mNumQHeads * mHeadSize;
                 int32_t const strideSeqQ = mNumQHeads * mHeadSize;
@@ -997,7 +948,6 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                     runtimeBatchSize, mNumQHeads, mNumKVHeads, kvCacheCapacity,
                     strideBzQ, strideSeqQ, mHeadSize, strideBzQ, strideSeqQ, mHeadSize, smScaleF, stream);
                 return 0;
-#endif
             }
         }
 
