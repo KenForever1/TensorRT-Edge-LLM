@@ -426,18 +426,21 @@ __global__ void sage_attn_fused_kernel(
     DTypeOut *O_lane = O + batch_id * stride_bz_o + head_id * stride_h_o
         + (CTA_Q / num_warps * warp_id + lane_id / line_lanes_o) * stride_seq_o
         + (lane_id % line_lanes_o) * 8;
+    uint32_t offset_O = smem_O.get_permuted_offset(
+        get_warp_idx_q<num_warps_q, num_warps_k>() * WARP_Q + lane_id / line_lanes_o,
+        lane_id % line_lanes_o);
     uint32_t O_load_idx = CTA_Q / num_warps * warp_id + lane_id / line_lanes_o;
 
     for (uint32_t ci = 0; ci < o_smem_col_iters; ci++) {
         for (uint32_t ri = 0; ri < o_smem_row_iters; ri++) {
             if (O_load_idx < qo_len) {
-                uint32_t sw_off = smem_O.get_permuted_offset(
-                    warp_id * copy_lines_o * o_smem_col_iters + ci * copy_lines_o + ri,
-                    lane_id % line_lanes_o);
-                *(uint4*)O_lane = smem_O.base[sw_off];
+                *(uint4*)O_lane = smem_O.base[offset_O];
             }
             O_lane += line_lanes_o * 8;
+            offset_O = smem_O.advance_offset_by_column<line_lanes_o>(offset_O);
         }
+        offset_O = smem_O.advance_offset_by_row<copy_lines_o>(
+            offset_O - (o_smem_row_iters * line_lanes_o));
         O_lane += (copy_lines_o * stride_seq_o) - (o_smem_row_iters * line_lanes_o * 8);
         O_load_idx += copy_lines_o;
     }
