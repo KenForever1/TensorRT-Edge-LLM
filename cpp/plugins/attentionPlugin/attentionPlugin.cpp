@@ -630,34 +630,16 @@ size_t AttentionPlugin::getWorkspaceSize([[maybe_unused]] nvinfer1::PluginTensor
     if (!mEnableFp8KVCache && mSlidingWindowSize <= 0
         && SageAttentionRunner::canImplement(mHeadSize, mSMVersion, mDataType))
     {
-        int64_t const maxSagePaddedKvLen = sage::getSagePaddedKvLen(static_cast<int32_t>(maxKVCacheCapacity));
         workspaceSize = accumulateWorkspaceSize(
             workspaceSize, rt::Coords{maxBatchSize, 1, mNumQHeads, mHeadSize}, DataType::kINT8);
         workspaceSize = accumulateWorkspaceSize(workspaceSize,
-            rt::Coords{maxBatchSize, maxKVCacheCapacity, mNumKVHeads, mHeadSize}, DataType::kINT8);
-        workspaceSize = accumulateWorkspaceSize(workspaceSize,
-            rt::Coords{maxBatchSize, mHeadSize, mNumKVHeads, maxSagePaddedKvLen}, DataType::kINT8);
-        workspaceSize = accumulateWorkspaceSize(workspaceSize,
             rt::Coords{sage::getSageQScaleSize(static_cast<int32_t>(maxBatchSize), 1, mNumQHeads)}, DataType::kFLOAT);
-        workspaceSize = accumulateWorkspaceSize(workspaceSize,
-            rt::Coords{sage::getSageKScaleSize(static_cast<int32_t>(maxBatchSize), static_cast<int32_t>(maxKVCacheCapacity),
-                mNumKVHeads)},
-            DataType::kFLOAT);
         workspaceSize = accumulateWorkspaceSize(workspaceSize,
             rt::Coords{sage::getSageVScaleSize(static_cast<int32_t>(maxBatchSize), mNumKVHeads, mHeadSize)},
             DataType::kFLOAT);
         workspaceSize = accumulateWorkspaceSize(workspaceSize,
             rt::Coords{sage::getSageVScaleSize(static_cast<int32_t>(maxBatchSize), mNumKVHeads, mHeadSize)},
             DataType::kFLOAT); // kMean: same size as vScale
-        // Partials buffers for fused stats: per-warp-block V max and K sum.
-        workspaceSize = accumulateWorkspaceSize(workspaceSize,
-            rt::Coords{sage::getSageStatsPartialsSize(static_cast<int32_t>(maxBatchSize),
-                static_cast<int32_t>(maxKVCacheCapacity), mNumKVHeads, mHeadSize)},
-            DataType::kFLOAT);
-        workspaceSize = accumulateWorkspaceSize(workspaceSize,
-            rt::Coords{sage::getSageStatsPartialsSize(static_cast<int32_t>(maxBatchSize),
-                static_cast<int32_t>(maxKVCacheCapacity), mNumKVHeads, mHeadSize)},
-            DataType::kFLOAT);
     }
 
     // Request another alignment size to align the workspace pointer.
@@ -905,38 +887,23 @@ int32_t AttentionPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
                 mNumQHeads, mNumKVHeads, mSlidingWindowSize, mEnableTreeAttention, mEnableFp8KVCache);
             if (useSageDecode && kvCacheCapacity > 0)
             {
-                // Restored from commit f673b99 (pre-fusion). Convert kv cache once via the
-                // proven launcher, then dispatch the SageAttentionRunner. This is the
-                // graph-capture safe path that produced correct outputs in inference.
+                // Lightweight fused decode path: Q is quantized once, V scale and K mean
+                // are computed per channel, and the fused kernel quantizes K/V in-kernel.
                 int32_t const qoLen = runtimeSeqLen;
-                int32_t const kvLen = kvCacheCapacity;
-                int32_t const paddedKvLen = sage::getSagePaddedKvLen(kvLen);
 
                 rt::Tensor qInt8Tensor = assignTensorFromWorkspace(
                     alignedWorkspacePtr, {runtimeBatchSize, qoLen, mNumQHeads, mHeadSize}, DataType::kINT8);
-                rt::Tensor kInt8Tensor = assignTensorFromWorkspace(
-                    alignedWorkspacePtr, {runtimeBatchSize, kvLen, mNumKVHeads, mHeadSize}, DataType::kINT8);
-                rt::Tensor vFp8Tensor = assignTensorFromWorkspace(
-                    alignedWorkspacePtr, {runtimeBatchSize, mHeadSize, mNumKVHeads, paddedKvLen}, DataType::kINT8);
                 rt::Tensor qScaleTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
                     {sage::getSageQScaleSize(runtimeBatchSize, qoLen, mNumQHeads)}, DataType::kFLOAT);
-                rt::Tensor kScaleTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
-                    {sage::getSageKScaleSize(runtimeBatchSize, kvLen, mNumKVHeads)}, DataType::kFLOAT);
                 rt::Tensor vScaleTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
                     {sage::getSageVScaleSize(runtimeBatchSize, mNumKVHeads, mHeadSize)}, DataType::kFLOAT);
                 rt::Tensor kMeanTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
                     {sage::getSageVScaleSize(runtimeBatchSize, mNumKVHeads, mHeadSize)}, DataType::kFLOAT);
-                rt::Tensor partialVMaxTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
-                    {sage::getSageStatsPartialsSize(runtimeBatchSize, kvLen, mNumKVHeads, mHeadSize)}, DataType::kFLOAT);
-                rt::Tensor partialKSumTensor = assignTensorFromWorkspace(alignedWorkspacePtr,
-                    {sage::getSageStatsPartialsSize(runtimeBatchSize, kvLen, mNumKVHeads, mHeadSize)}, DataType::kFLOAT);
 
                 sage::launchSageQuantizeQToInt8(qInputTensor, qInt8Tensor, qScaleTensor, stream);
-                sage::launchSageConvertKVCacheToInt8AndFp8(
-                    kvCacheTensor, contextLengthTensor, kInt8Tensor, vFp8Tensor, kScaleTensor,
-                    vScaleTensor, kMeanTensor, partialVMaxTensor, partialKSumTensor, kvLen, stream);
+                sage::launchSageComputeVScalesAndKMeans(
+                    kvCacheTensor, contextLengthTensor, vScaleTensor, kMeanTensor, kvCacheCapacity, stream);
 
-                // Production: fused SageAttention kernel
                 int32_t const strideBzQ = qoLen * mNumQHeads * mHeadSize;
                 int32_t const strideSeqQ = mNumQHeads * mHeadSize;
                 float const smScaleF = 1.0f / std::sqrt(static_cast<float>(mHeadSize));

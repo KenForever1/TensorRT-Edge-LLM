@@ -285,6 +285,13 @@ __global__ void convertKvCacheToSageKernelFused(half const* kvCache, int32_t con
         {
             kScale[scaleIdx] = kMIN_SCALE;
         }
+        if (threadIdx.x < headDim)
+        {
+            int32_t const dim = threadIdx.x;
+            int32_t const partialIdx = ((batch * numHeads + head) * numBlocks + blockSeq) * headDim + dim;
+            partialVMax[partialIdx] = 0.0F;
+            partialKSum[partialIdx] = 0.0F;
+        }
         return;
     }
 
